@@ -128,6 +128,11 @@ pub trait Backend {
     fn mouse_down(&mut self) -> bool {
         false
     }
+    /// Whether Mission Control is open. Windows are not where their frames
+    /// say then: the pointer over a thumbnail is not over that window.
+    fn overview_open(&mut self) -> bool {
+        false
+    }
     /// The mouse pointer, in the same coordinates as window frames.
     fn cursor(&mut self) -> Option<(f32, f32)> {
         None

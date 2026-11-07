@@ -138,6 +138,19 @@ unsafe fn listen() -> Result<(), &'static str> {
                 ptr::null_mut() => Id);
         }
 
+        // AppKit updates `NSScreen` when it gets to it, which can be after
+        // the display callback and the second of looking that follows.
+        let app_center: Id =
+            msg!(objc_getClass(c"NSNotificationCenter".as_ptr()), "defaultCenter"; -> Id);
+        if !app_center.is_null() {
+            let name = cfstring("NSApplicationDidChangeScreenParametersNotification");
+            msg!(app_center, "addObserver:selector:name:object:",
+                observer => Id,
+                sel(c"changed:") => Sel,
+                name.ptr().cast_mut() => Id,
+                ptr::null_mut() => Id);
+        }
+
         if CGDisplayRegisterReconfigurationCallback(display_changed, ptr::null_mut()) != 0 {
             warn!("no display change notifications");
         }

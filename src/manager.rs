@@ -1543,6 +1543,12 @@ impl<B: Backend> Manager<B> {
                 return;
             }
         }
+        // Focusing raises, and Mission Control would show the windows in
+        // their new order: two of the same frame swap places.
+        if self.backend.overview_open() {
+            debug!("focus follows mouse: Mission Control is open");
+            return;
+        }
         // Spotlight and the like close when they lose the keyboard.
         if self.backend.panel_has_focus() {
             debug!("focus follows mouse: a panel has the keyboard; leaving it");
@@ -2929,6 +2935,7 @@ pub(crate) mod tests {
         pub area: Rect,
         pub focus_calls: Vec<WinId>,
         pub hidden: Vec<(WinId, bool)>,
+        pub overview: bool,
         pub launched: Vec<String>,
         pub mouse: bool,
         pub cursor: (f32, f32),
@@ -3161,6 +3168,9 @@ pub(crate) mod tests {
         fn focus(&mut self, id: WinId) {
             self.focus_calls.push(id);
             self.focused = Some(id);
+        }
+        fn overview_open(&mut self) -> bool {
+            self.overview
         }
         fn set_app_hidden(&mut self, id: WinId, hidden: bool) {
             self.hidden.push((id, hidden));
@@ -4416,6 +4426,24 @@ pub(crate) mod tests {
         m.refresh();
         assert_eq!(m.tree().windows(), vec![1, 2]);
         hover(&mut m, (100.0, 300.0), 0.1);
+        hover(&mut m, (700.0, 300.0), 0.3);
+        assert_eq!(m.backend().focus_calls, vec![2]);
+    }
+
+    #[test]
+    fn focus_follows_mouse_waits_out_mission_control() {
+        let mut m = ffm();
+        m.backend.open(1, "Terminal");
+        m.backend.open(2, "Safari");
+        m.refresh();
+        m.backend.focused = Some(1);
+        m.refresh();
+        hover(&mut m, (100.0, 300.0), 0.1);
+        m.backend.overview = true;
+        hover(&mut m, (700.0, 300.0), 0.3);
+        assert!(m.backend().focus_calls.is_empty());
+        m.backend.overview = false;
+        hover(&mut m, (100.0, 300.0), 0.3);
         hover(&mut m, (700.0, 300.0), 0.3);
         assert_eq!(m.backend().focus_calls, vec![2]);
     }

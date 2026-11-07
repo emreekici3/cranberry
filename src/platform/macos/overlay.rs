@@ -46,7 +46,6 @@ const CORNER_RADIUS: f64 = 10.0;
 const BORDER_WIDTH: f64 = 2.0;
 
 pub struct OverlayWindow {
-    app: Id,
     window: Id,
     layer: Id,
     color: Option<[f32; 4]>,
@@ -106,7 +105,6 @@ impl OverlayWindow {
             msg!(layer, "setCornerRadius:", CORNER_RADIUS => f64);
             msg!(layer, "setBorderWidth:", BORDER_WIDTH => f64);
             Some(Self {
-                app,
                 window,
                 layer,
                 color: None,
@@ -203,15 +201,18 @@ impl OverlayWindow {
             self.visible = false;
         }
     }
+}
 
-    /// Hands pending AppKit events to the app so the window draws and
-    /// stays responsive. cberry has no run loop of its own to do this.
-    pub fn pump(&mut self) {
+/// Hands pending AppKit events to the app, so cberry's windows draw and
+/// `NSScreen` keeps up with displays plugged in or out, overlay or not.
+/// cberry has no run loop of its own to do this.
+pub fn pump_app(app: Id) {
+    {
         unsafe {
             let pool = objc_autoreleasePoolPush();
             let distant_past: Id = msg!(class(c"NSDate"), "distantPast"; -> Id);
             loop {
-                let event: Id = msg!(self.app, "nextEventMatchingMask:untilDate:inMode:dequeue:",
+                let event: Id = msg!(app, "nextEventMatchingMask:untilDate:inMode:dequeue:",
                     usize::MAX => usize,
                     distant_past => Id,
                     NSDefaultRunLoopMode => Id,
@@ -220,7 +221,7 @@ impl OverlayWindow {
                 if event.is_null() {
                     break;
                 }
-                msg!(self.app, "sendEvent:", event => Id);
+                msg!(app, "sendEvent:", event => Id);
             }
             objc_autoreleasePoolPop(pool);
         }

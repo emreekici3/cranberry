@@ -1654,6 +1654,10 @@ impl Backend for MacBackend {
         desktop::switch(n)
     }
 
+    fn overview_open(&mut self) -> bool {
+        self.mission_control_open()
+    }
+
     fn set_app_hidden(&mut self, id: WinId, hidden: bool) {
         let Some(pid) = self.windows.get(&id).map(|w| w.pid) else {
             warn!("window {id} is not known: cannot hide or show its app");
@@ -1812,8 +1816,14 @@ impl Backend for MacBackend {
     fn pump(&mut self) {
         // Deliver pending AX notifications (they arrive as run loop sources).
         unsafe { CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0.0, 0) };
-        if let Some(w) = self.overlay.as_mut().or(self.border.as_mut()) {
-            w.pump();
+        let app = unsafe {
+            let class = objc_getClass(c"NSApplication".as_ptr());
+            let send: unsafe extern "C" fn(Id, Sel) -> Id =
+                std::mem::transmute(objc_msgSend as unsafe extern "C" fn());
+            send(class, sel_registerName(c"sharedApplication".as_ptr()))
+        };
+        if !app.is_null() {
+            overlay::pump_app(app);
         }
     }
 
