@@ -751,6 +751,48 @@ impl MacBackend {
 }
 
 impl MacBackend {
+    /// A swipe can carry the border off with a Space and leave it there,
+    /// where AppKit still believes it is in place. Puts it back when the
+    /// window server has it elsewhere, and once the Spaces stop sliding.
+    fn check_border(&mut self) {
+        if self.border_checked.elapsed() < BORDER_CHECK {
+            return;
+        }
+        self.border_checked = std::time::Instant::now();
+        let now = std::time::Instant::now();
+        let space = self.active_space();
+        if std::mem::replace(&mut self.border_space, space) != space {
+            self.border_stale = true;
+            self.border_redo = Some(now + BORDER_REDO);
+        }
+        // A swipe let go of goes back to the same Space, and can still
+        // carry the border off.
+        let sliding = tap::swiping() || spaces_sliding(self.connection);
+        let settled = std::mem::replace(&mut self.border_sliding, sliding) && !sliding;
+        if sliding {
+            self.border_stale = true;
+            self.border_redo = Some(now + BORDER_REDO);
+        }
+        let redo = !sliding && self.border_redo.is_some_and(|at| now >= at);
+        if redo {
+            self.border_redo = None;
+        }
+        let Some((want, number)) = self.border.as_ref().and_then(OverlayWindow::shown_at) else {
+            return;
+        };
+        let off = |a: i32, b: i32| (a - b).abs() > BORDER_SLACK;
+        let moved = !sliding
+            && self.server_frame(number).is_some_and(|r| {
+                off(r.x, want.x) || off(r.y, want.y) || off(r.w, want.w) || off(r.h, want.h)
+            });
+        if settled || moved || redo {
+            debug!("drawing the border anew (moved: {moved})");
+            self.border_stale = true;
+            let wanted = self.border_wanted;
+            self.show_border(wanted);
+        }
+    }
+
     /// Waits for `done`, which a slow window server can leave for a moment.
     fn settles(&mut self, mut done: impl FnMut(&mut Self) -> bool) -> bool {
         let start = std::time::Instant::now();
@@ -857,6 +899,12 @@ impl MacBackend {
     }
 }
 
+/// How often the border is looked at, and how far off it may be.
+const BORDER_CHECK: std::time::Duration = std::time::Duration::from_millis(100);
+const BORDER_SLACK: i32 = 2;
+/// How long after a Space switch the border is drawn anew, for the slide to
+/// have ended.
+const BORDER_REDO: std::time::Duration = std::time::Duration::from_millis(350);
 /// How many in a row can fail before the slower way is taken for good.
 const INSTANT_MISSES: u8 = 3;
 /// How long a move or switch at once is given to show.
@@ -1094,6 +1142,17 @@ pub struct MacBackend {
     window_bounds: Option<SLSGetWindowBoundsFn>,
     /// The ring around the focused window, once one was asked for.
     border: Option<OverlayWindow>,
+    /// When the border was last checked, and whether the Spaces slid then.
+    border_checked: std::time::Instant,
+    border_sliding: bool,
+    /// The border last asked for, and whether a slide may have left its
+    /// window astray since it was shown.
+    border_wanted: Option<Border>,
+    border_stale: bool,
+    /// The Space the border was last checked on, and when to draw it anew
+    /// after a switch, once the switch is over.
+    border_space: u64,
+    border_redo: Option<std::time::Instant>,
     /// Write the frames, a thread per app.
     vsync: vsync::Vsync,
     /// Whether the window server may still heed these ways of moving a
@@ -1139,6 +1198,12 @@ impl MacBackend {
             overlay: None,
             window_bounds: unsafe { lookup(c"SLSGetWindowBounds") },
             border: None,
+            border_checked: std::time::Instant::now(),
+            border_sliding: false,
+            border_wanted: None,
+            border_stale: false,
+            border_space: 0,
+            border_redo: None,
             vsync: vsync::Vsync::default(),
             move_misses: 0,
             switch_misses: 0,
@@ -1792,10 +1857,17 @@ impl Backend for MacBackend {
     }
 
     fn space_swiping(&mut self) -> bool {
-        tap::swiping() || (tap::swiped_lately() && spaces_sliding(self.connection))
+        // Swipes the tap missed still slide the Spaces.
+        tap::swiping() || spaces_sliding(self.connection)
     }
 
     fn show_border(&mut self, border: Option<Border>) {
+        self.border_wanted = border;
+        // A window a slide carried off can stay drawn where it went, though
+        // the window server says it is in place: a new one is not.
+        if border.is_some() && std::mem::take(&mut self.border_stale) {
+            self.border = None;
+        }
         let Some(b) = border else {
             if let Some(w) = &mut self.border {
                 w.hide();
@@ -1816,6 +1888,7 @@ impl Backend for MacBackend {
     fn pump(&mut self) {
         // Deliver pending AX notifications (they arrive as run loop sources).
         unsafe { CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0.0, 0) };
+        self.check_border();
         let app = unsafe {
             let class = objc_getClass(c"NSApplication".as_ptr());
             let send: unsafe extern "C" fn(Id, Sel) -> Id =

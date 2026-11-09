@@ -83,6 +83,8 @@ pub struct Manager<B: Backend> {
     /// A window that must end up focused, until when, and when to try next:
     /// macOS hands focus around for a moment after a Space switch.
     holding_focus: Option<(WinId, std::time::Instant, std::time::Instant)>,
+    /// When the focused window's frame was last read again.
+    frame_checked: Option<std::time::Instant>,
     /// The scratchpad being started: its window is shown when it appears.
     scratch_starting: Option<String>,
     /// The window of each scratchpad.
@@ -178,6 +180,10 @@ const FOCUS_FOLLOWS_MOUSE_DELAY: f64 = 0.1;
 
 /// How soon after a window is sent to a Space going there brings it focus.
 const FOLLOW_SENT: std::time::Duration = std::time::Duration::from_secs(2);
+/// How often the focused window's frame is read again, and how far off the
+/// one known may be.
+const FRAME_CHECK: std::time::Duration = std::time::Duration::from_millis(100);
+const FRAME_SLACK: i32 = 2;
 /// How long after that the window is kept in focus, and how often it is looked at.
 const HOLD_FOCUS: std::time::Duration = std::time::Duration::from_millis(500);
 const HOLD_FOCUS_RETRY: std::time::Duration = std::time::Duration::from_millis(30);
@@ -240,6 +246,7 @@ impl<B: Backend> Manager<B> {
             focus_moved: None,
             sent: None,
             holding_focus: None,
+            frame_checked: None,
             scratch_starting: None,
             scratch_windows: HashMap::new(),
             scratch_spaces: Vec::new(),
@@ -1646,6 +1653,9 @@ impl<B: Backend> Manager<B> {
             .filter(|id| self.stack.contains(id) && self.movable.contains(id))?;
         // A window dragged by its title bar tells nobody where it is going.
         let dragged = self.backend.mouse_down() && !matches!(self.drag, Drag::Gesture(_));
+        if !dragged {
+            self.check_frame(id);
+        }
         let frame = self.frames.get(&id).copied()?;
         let live = dragged.then(|| self.backend.server_frame(id)).flatten();
         self.border_tracking = live.is_some();
@@ -1677,6 +1687,33 @@ impl<B: Backend> Manager<B> {
                 .config
                 .border_radius_for(self.apps.get(&id).map_or("", String::as_str)),
         })
+    }
+
+    /// Reads again where a window is, now and then, when nothing of
+    /// cberry's moves it. A Space seen while it slid gives frames that are
+    /// off by how far it had come, and nothing says so when it stops.
+    fn check_frame(&mut self, id: WinId) {
+        let now = std::time::Instant::now();
+        if self
+            .frame_checked
+            .is_some_and(|at| now.duration_since(at) < FRAME_CHECK)
+            || self.mover.in_motion(id)
+            || self.backend.space_swiping()
+        {
+            return;
+        }
+        self.frame_checked = Some(now);
+        let Some(seen) = self.backend.window_frame(id) else {
+            return;
+        };
+        let known = self.frames.get(&id).copied();
+        let off = |a: i32, b: i32| (a - b).abs() > FRAME_SLACK;
+        if known.is_some_and(|k| {
+            off(k.x, seen.x) || off(k.y, seen.y) || off(k.w, seen.w) || off(k.h, seen.h)
+        }) {
+            debug!("window {id} is at {seen:?}, not {known:?}");
+            self.frames.insert(id, seen);
+        }
     }
 
     fn update_border(&mut self) {
@@ -4745,6 +4782,25 @@ pub(crate) mod tests {
         for (id, frame) in before {
             assert_eq!(m.backend().frame(id), frame);
         }
+    }
+
+    #[test]
+    fn the_border_catches_up_with_a_frame_seen_mid_slide() {
+        let mut m = manager(0.0);
+        m.config.border = true;
+        m.backend.open(1, "A");
+        m.refresh();
+        m.backend.focused = Some(1);
+        m.refresh();
+        m.pump();
+        let real = m.backend().frame(1);
+        // Seen while its Space slid in.
+        m.frames
+            .insert(1, Rect::new(real.x + 400, real.y, real.w, real.h));
+        m.frame_checked = None;
+        m.pump();
+        assert_eq!(m.frames[&1], real);
+        assert_eq!(m.shown_border.map(|b| b.rect), Some(real));
     }
 
     #[test]

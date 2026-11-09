@@ -52,6 +52,18 @@ pub struct OverlayWindow {
     /// The width and radius a ring was last drawn with.
     ring: Option<(f64, f64)>,
     visible: bool,
+    /// Where it was last put, as window frames are given.
+    placed: Option<Rect>,
+}
+
+impl Drop for OverlayWindow {
+    fn drop(&mut self) {
+        unsafe {
+            msg!(self.window, "orderOut:", ptr::null_mut::<c_void>() => Id);
+            msg!(self.window, "close");
+            msg!(self.window, "release");
+        }
+    }
 }
 
 impl OverlayWindow {
@@ -110,6 +122,7 @@ impl OverlayWindow {
                 color: None,
                 ring: None,
                 visible: false,
+                placed: None,
             })
         }
     }
@@ -193,6 +206,14 @@ impl OverlayWindow {
             msg!(catx, "flush");
         }
         self.visible = true;
+        self.placed = Some(rect);
+    }
+
+    /// Where it should be while shown, and its window server number.
+    pub fn shown_at(&self) -> Option<(Rect, u32)> {
+        let number: isize = unsafe { msg!(self.window, "windowNumber"; -> isize) };
+        let number = u32::try_from(number).ok()?;
+        self.visible.then_some(self.placed?).map(|r| (r, number))
     }
 
     pub fn hide(&mut self) {

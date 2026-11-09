@@ -75,8 +75,6 @@ const PHASE_CANCELLED: i64 = 8;
 /// A swipe is over this long after its last event: it also covers the Spaces
 /// settling.
 const SWIPE_SETTLE: Duration = Duration::from_millis(400);
-/// How long after a swipe the Spaces are watched for still sliding.
-const SWIPE_AFTERMATH: Duration = Duration::from_secs(3);
 /// Fingers held still send no events, so a swipe lasts until it ends. This
 /// long without one, its end was missed.
 const SWIPE_HELD: Duration = Duration::from_secs(10);
@@ -173,12 +171,6 @@ pub fn swiping() -> bool {
         SWIPE_SETTLE
     };
     age < lasting.as_millis() as u64
-}
-
-/// Whether a swipe was seen not long ago, so what it set off may still run.
-pub fn swiped_lately() -> bool {
-    let last = LAST_SWIPE.load(Relaxed);
-    last != 0 && millis().saturating_sub(last) < SWIPE_AFTERMATH.as_millis() as u64
 }
 
 /// Notes Dock swipes. It only listens, so a swipe never waits for it.
