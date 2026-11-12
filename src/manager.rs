@@ -671,6 +671,14 @@ impl<B: Backend> Manager<B> {
             if !wide && !tall {
                 continue;
             }
+            // Known already: nothing to wait for, so no more looks for it.
+            if let Some(entry) = self.refused.get_mut(&id)
+                && (!wide || entry.0 >= f.w)
+                && (!tall || entry.1 >= f.h)
+            {
+                entry.2 = now;
+                continue;
+            }
             let size = (f.w, f.h);
             let since = match self.oversized.get(&id) {
                 Some(&(s, at)) if s == size => at,
@@ -5765,6 +5773,22 @@ pub(crate) mod tests {
         m.backend.frame_rate = Some(1000.0);
         assert!((ms(&mut m) - 4.17).abs() < 0.01, "no faster than 240");
     }
+    #[test]
+    fn a_window_that_never_fits_does_not_keep_cberry_looking() {
+        // Too big for its half from the start: nothing to go back to.
+        let mut m = manager(0.0);
+        m.backend.open(1, "Claude");
+        m.backend.min.insert(1, (700, 0));
+        m.refresh();
+        m.backend.open(2, "Terminal");
+        for _ in 0..4 {
+            m.refresh();
+            settle(&mut m);
+        }
+        assert!(m.refused.contains_key(&1));
+        assert!(!m.wants_another_look(), "learned, and done looking");
+    }
+
     #[test]
     fn a_window_that_will_not_shrink_is_not_squeezed_under_its_neighbour() {
         // Claude (1) on the left will not get narrower than 400 points.
