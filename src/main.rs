@@ -106,11 +106,12 @@ fn run() -> ExitCode {
     use cranberry::daemon;
     use cranberry::platform::macos::{MacBackend, ensure_accessibility};
 
-    // Let everything up to debug through, but show only info unless asked:
-    // `cberry config log_level debug` turns the rest on without a restart.
+    // Let everything through, but show only info unless asked:
+    // `cberry config log_level debug` (or `trace`, every frame written)
+    // turns the rest on without a restart.
     let env = env_logger::Env::default();
     let chosen = std::env::var_os(env_logger::DEFAULT_FILTER_ENV).is_some();
-    env_logger::Builder::from_env(env.default_filter_or("debug"))
+    env_logger::Builder::from_env(env.default_filter_or("trace"))
         .format_timestamp_millis()
         .init();
     if !chosen {

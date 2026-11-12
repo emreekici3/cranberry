@@ -1,15 +1,14 @@
 //! Window motion.
 //!
-//! A window is four edges, not a position and a size. Each edge follows its
-//! goal through three critically damped poles: `(x - goal)` decays as
-//! `(c0 + c1 t + c2 t^2) e^(-w t)`. Three things come of that:
+//! A window is four edges, not a position and a size. Each edge goes from
+//! where it was to its goal along macOS's own timing curve (Core Animation's
+//! default, the cubic Bézier `0.25, 0.1, 0.25, 1`): a short soft start, most
+//! of the way early, and a long gentle landing.
 //!
-//! * Position, velocity and acceleration are all continuous, so a window
-//!   neither jerks off the mark nor when it is sent somewhere new in flight:
-//!   it bends toward the new goal, carrying what it had.
-//! * Each step is the exact solution over `dt`, so the path does not depend
-//!   on the frame rate.
-//! * From rest it never overshoots.
+//! * The curve is a function of the time gone by, so the path does not
+//!   depend on the frame rate.
+//! * It never overshoots. Sent somewhere new in flight, a window heads there
+//!   from where it is, on a new curve.
 //!
 //! Edges are also what makes the rounding to whole points clean. Rounding
 //! `x` and `w` apart lets a still edge wobble by a point; here a still edge
@@ -23,14 +22,10 @@ use crate::geometry::Rect;
 
 /// Largest step a single frame may take, in seconds. A late frame still
 /// covers the time that went by; only a real stall is cut short.
-const MAX_STEP: f64 = 0.1;
-/// `w * duration`, so that `duration` is when 0.7 % of the distance is left:
-/// `(1 + u + u^2 / 2) e^-u = 0.007` at this `u`.
-const DURATION_POLES: f64 = 8.8;
-/// An edge this close to its goal (points) and this slow (points a second)
-/// has arrived.
-const REST_DISTANCE: f64 = 0.25;
-const REST_SPEED: f64 = 8.0;
+const MAX_STEP: f64 = 0.05;
+/// Core Animation's default timing curve: control points of a cubic Bézier
+/// from `(0, 0)` to `(1, 1)`.
+const CURVE: (f64, f64, f64, f64) = (0.25, 0.1, 0.25, 1.0);
 /// How far a frame's time may be from a whole number of refreshes and still
 /// count as exactly that many, as a share of a refresh.
 const PACE_TOLERANCE: f64 = 0.2;
@@ -51,56 +46,58 @@ pub fn paced(dt: f64, refresh: f64) -> f64 {
     }
 }
 
+/// How far along the curve (0 to 1) a motion is when `x` (0 to 1) of its
+/// time has gone by.
+fn eased(x: f64) -> f64 {
+    let (x1, y1, x2, y2) = CURVE;
+    let bezier = |s: f64, a: f64, b: f64| {
+        let r = 1.0 - s;
+        3.0 * r * r * s * a + 3.0 * r * s * s * b + s * s * s
+    };
+    let x = x.clamp(0.0, 1.0);
+    // The curve's x grows with s: halve the interval down to the s for x.
+    let (mut lo, mut hi) = (0.0, 1.0);
+    for _ in 0..40 {
+        let mid = (lo + hi) / 2.0;
+        if bezier(mid, x1, x2) < x {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+    bezier((lo + hi) / 2.0, y1, y2)
+}
+
 #[derive(Clone, Copy, Debug)]
 struct Edge {
+    from: f64,
     pos: f64,
-    vel: f64,
-    acc: f64,
     goal: f64,
 }
 
 impl Edge {
     fn at(pos: i32, goal: i32) -> Self {
+        let pos = f64::from(pos);
         Self {
-            pos: f64::from(pos),
-            vel: 0.0,
-            acc: 0.0,
+            from: pos,
+            pos,
             goal: f64::from(goal),
         }
     }
 
-    fn step(&mut self, t: f64, w: f64) {
-        let c0 = self.pos - self.goal;
-        let c1 = self.vel + w * c0;
-        let c2 = (self.acc + 2.0 * w * c1 - w * w * c0) / 2.0;
-        let decay = (-w * t).exp();
-        let x = c0 + t * (c1 + t * c2);
-        let dx = c1 + 2.0 * c2 * t;
-        self.pos = self.goal + decay * x;
-        self.vel = decay * (dx - w * x);
-        self.acc = decay * (2.0 * c2 - 2.0 * w * dx + w * w * x);
-    }
-
-    fn arrived(&self) -> bool {
-        (self.pos - self.goal).abs() < REST_DISTANCE && self.vel.abs() < REST_SPEED
-    }
-
-    /// Exactly where it started, and going nowhere.
+    /// Exactly where it is going, and was all along.
     fn still(&self) -> bool {
-        self.pos == self.goal && self.vel == 0.0 && self.acc == 0.0
+        self.from == self.goal && self.pos == self.goal
     }
 
+    /// A new goal, set out for from where it is.
     fn set_goal(&mut self, goal: i32) {
+        self.from = self.pos;
         self.goal = f64::from(goal);
     }
 
-    fn stop(&mut self) {
-        *self = Self {
-            pos: self.goal,
-            vel: 0.0,
-            acc: 0.0,
-            goal: self.goal,
-        };
+    fn put(&mut self, along: f64) {
+        self.pos = self.from + (self.goal - self.from) * along;
     }
 }
 
@@ -123,6 +120,8 @@ struct Motion {
     top: Edge,
     right: Edge,
     bottom: Edge,
+    /// Seconds since it set out for `target`.
+    elapsed: f64,
     target: Rect,
     shown: Rect,
 }
@@ -134,6 +133,7 @@ impl Motion {
             top: Edge::at(from.y, to.y),
             right: Edge::at(from.max_x(), to.max_x()),
             bottom: Edge::at(from.max_y(), to.max_y()),
+            elapsed: 0.0,
             target: to,
             shown: from,
         }
@@ -149,27 +149,26 @@ impl Motion {
     }
 
     fn aim(&mut self, to: Rect) {
+        if to == self.target {
+            return;
+        }
         self.target = to;
+        self.elapsed = 0.0;
         self.left.set_goal(to.x);
         self.top.set_goal(to.y);
         self.right.set_goal(to.max_x());
         self.bottom.set_goal(to.max_y());
     }
 
-    /// Advances `t` seconds. Returns whether it is done.
-    fn advance(&mut self, t: f64, w: f64) -> bool {
+    /// Advances `t` seconds of a motion `duration` long. Returns whether it
+    /// is done.
+    fn advance(&mut self, t: f64, duration: f64) -> bool {
+        self.elapsed += t;
+        let along = eased(self.elapsed / duration);
         for edge in self.edges() {
-            if !edge.still() {
-                edge.step(t, w);
-            }
+            edge.put(along);
         }
-        let done = self.edges().iter().all(|e| e.arrived());
-        if done {
-            for edge in self.edges() {
-                edge.stop();
-            }
-        }
-        done
+        self.elapsed >= duration
     }
 
     fn frame(&self) -> Rect {
@@ -237,10 +236,10 @@ impl Mover {
     /// Advances everything by `dt` seconds. Returns the frames that changed.
     pub fn advance(&mut self, dt: f64) -> Vec<(WinId, Rect)> {
         let t = dt.clamp(0.0, MAX_STEP);
-        let w = DURATION_POLES / self.duration.max(f64::EPSILON);
+        let duration = self.duration.max(f64::EPSILON);
         let mut changed = Vec::with_capacity(self.motions.len());
         self.motions.retain(|&id, motion| {
-            let done = motion.advance(t, w);
+            let done = motion.advance(t, duration);
             let frame = if done { motion.target } else { motion.frame() };
             // The last frame goes out even if rounding got there sooner: it
             // is the one a window is told it stays at.
@@ -288,14 +287,16 @@ mod tests {
     #[test]
     fn it_takes_about_its_duration() {
         let n = sent(FROM, FAR).len();
-        assert!((14..=26).contains(&n), "{n} frames for 18 at 60 fps");
+        assert!((17..=19).contains(&n), "{n} frames for 18 at 60 fps");
     }
 
     #[test]
-    fn the_constant_means_what_it_says() {
-        let u: f64 = DURATION_POLES;
-        let left = (1.0 + u + u * u / 2.0) * (-u).exp();
-        assert!((left - 0.007).abs() < 0.0005, "{left}");
+    fn the_curve_is_core_animations_default() {
+        assert!(eased(0.0).abs() < 1e-9);
+        assert!((eased(1.0) - 1.0).abs() < 1e-9);
+        // Known points of `0.25, 0.1, 0.25, 1`.
+        assert!((eased(0.5) - 0.8024).abs() < 0.001, "{}", eased(0.5));
+        assert!((eased(0.25) - 0.4094).abs() < 0.001, "{}", eased(0.25));
     }
 
     #[test]
@@ -306,48 +307,28 @@ mod tests {
     }
 
     #[test]
-    fn it_gathers_speed_and_settles_gently() {
+    fn it_starts_softly_goes_most_of_the_way_early_and_lands_gently() {
         let xs: Vec<i32> = sent(FROM, FAR).iter().map(|f| f.x).collect();
-        let steps: Vec<i32> = xs.windows(2).map(|p| p[1] - p[0]).collect();
+        let steps: Vec<i32> = std::iter::once(xs[0])
+            .chain(xs.windows(2).map(|p| p[1] - p[0]))
+            .collect();
         let peak = *steps.iter().max().unwrap();
-        assert!(xs[0] < peak / 2, "starts softly: {xs:?}");
-        assert!(steps[0] < steps[1], "{steps:?}");
-        assert!(*steps.last().unwrap() <= 2, "{steps:?}");
+        assert!(steps[0] < peak, "{steps:?}");
+        assert!(xs[xs.len() / 2] > 750, "{xs:?}");
+        assert!(*steps.last().unwrap() <= 3, "{steps:?}");
     }
 
     #[test]
-    fn speed_never_changes_abruptly() {
-        let xs: Vec<i32> = sent(FROM, FAR).iter().map(|f| f.x).collect();
-        let steps: Vec<i32> = xs.windows(2).map(|p| p[1] - p[0]).collect();
-        let peak = *steps.iter().max().unwrap();
-        for pair in steps.windows(2) {
-            assert!((pair[1] - pair[0]).abs() <= peak / 2, "{steps:?}");
-        }
-    }
-
-    #[test]
-    fn a_new_goal_in_flight_bends_the_path() {
+    fn a_new_goal_in_flight_is_headed_for_from_where_it_is() {
         let mut a = Mover::new(0.3);
         a.send(1, FROM, FAR);
         let mut last = 0;
-        let mut step = 0;
-        for _ in 0..7 {
-            let x = a.advance(FRAME)[0].1.x;
-            step = x - last;
-            last = x;
+        for _ in 0..5 {
+            last = a.advance(FRAME)[0].1.x;
         }
-        // Further: it keeps going at the speed it had.
         a.send(1, FROM, Rect::new(2000, 0, 100, 100));
-        let next = a.advance(FRAME)[0].1.x - last;
-        assert!(
-            next >= step * 9 / 10 && next <= step * 13 / 10,
-            "{step} {next}"
-        );
-        // Back: it slows down before it turns.
+        assert!(a.advance(FRAME)[0].1.x > last);
         a.send(1, FROM, FROM);
-        let at = a.motions[&1].left.pos;
-        let after = a.advance(FRAME)[0].1.x;
-        assert!(f64::from(after) >= at, "turned at once");
         assert_eq!(*run(&mut a, FRAME).last().unwrap(), FROM);
     }
 

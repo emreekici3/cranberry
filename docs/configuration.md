@@ -6,7 +6,7 @@ The config is a shell script at `~/.config/cranberry/cberryrc`, run on startup:
 #!/bin/sh
 cberry config gap 8
 cberry config padding 8 8 8 8
-cberry config animation 0.25
+cberry config animation on
 cberry rule float "System Settings"
 ```
 
@@ -22,7 +22,7 @@ cberry reload
 |---|---|---|
 | `gap` | Space between windows | `8` |
 | `padding` | Space around the edges | `8 8 8 8` |
-| `animation` | Animation duration in seconds, `0` to disable | `0.42` |
+| `animation` | `on` or `off`. Windows slide in 0.25 s on macOS's own curve; neither can be changed | `on` |
 | `split_ratio` | Share the old window keeps when split | `0.5` |
 | `resize_step` | Step for `cberry resize` | `0.05` |
 | `rule_carry` | Let a Space rule carry a new window there, pointer and all, `on` / `off` | `on` |

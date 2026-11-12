@@ -8,9 +8,9 @@ use std::path::PathBuf;
 use crate::geometry::Padding;
 use crate::platform::{Modifier, MouseButton};
 
-/// `animation_speed` is an older way to say how long a window takes:
-/// this many over the duration.
-const SPEED_PER_DURATION: f64 = 5.0;
+/// How long a window takes to slide into place with `animation on`, in
+/// seconds: as long as macOS's own (Core Animation's default).
+pub const ANIMATION: f64 = 0.25;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Config {
@@ -18,8 +18,8 @@ pub struct Config {
     pub gap: i32,
     /// Space between the tiled area and the screen edges.
     pub padding: Padding,
-    /// How long a window takes to reach its place, in seconds; `0` disables
-    /// animations.
+    /// How long a window takes to reach its place, in seconds: `ANIMATION`
+    /// with `animation on`, `0` with `animation off`.
     pub animation_duration: f64,
     /// Share of the area the existing window keeps when a new one splits it.
     pub split_ratio: f32,
@@ -108,7 +108,7 @@ impl Default for Config {
         Self {
             gap: 8,
             padding: Padding::uniform(8),
-            animation_duration: 0.42,
+            animation_duration: ANIMATION,
             split_ratio: 0.5,
             resize_step: 0.05,
             poll_interval_ms: 150,
@@ -157,7 +157,7 @@ impl Config {
 pub const KEYS: &[&str] = &[
     "gap",
     "padding",
-    "animation_duration",
+    "animation",
     "split_ratio",
     "resize_step",
     "poll_interval",
@@ -351,28 +351,9 @@ impl Config {
                     _ => return Err("padding: give 1, 2 (vertical horizontal) or 4 (top right bottom left) values".into()),
                 };
             }
-            "animation_duration" | "animation" => {
-                let secs: f64 = number(key, one(key, args)?)?;
-                if !(0.0..=5.0).contains(&secs) {
-                    return Err(format!("{key}: must be between 0 and 5 seconds"));
-                }
-                self.animation_duration = secs;
-            }
-            // Kept so older configs still load.
-            "animation_speed" => {
-                let v: f64 = number(key, one(key, args)?)?;
-                if v < 0.0 {
-                    return Err("animation_speed: must not be negative".into());
-                }
-                self.animation_duration = if v == 0.0 {
-                    0.0
-                } else {
-                    SPEED_PER_DURATION / v
-                };
-            }
-            // Kept so older configs still load: there is one curve now.
-            "animation_easing" | "easing" => {
-                one(key, args)?;
+            "animation" => {
+                let on = on_off(key, one(key, args)?)?;
+                self.animation_duration = if on { ANIMATION } else { 0.0 };
             }
             "split_ratio" => {
                 let v: f32 = number(key, one(key, args)?)?;
@@ -483,7 +464,7 @@ impl Config {
                 let p = self.padding;
                 format!("{} {} {} {}", p.top, p.right, p.bottom, p.left)
             }
-            "animation_duration" | "animation" => self.animation_duration.to_string(),
+            "animation" => on_off_name(self.animation_duration > 0.0),
             "split_ratio" => self.split_ratio.to_string(),
             "resize_step" => self.resize_step.to_string(),
             "poll_interval" | "poll_interval_ms" => self.poll_interval_ms.to_string(),
@@ -625,11 +606,12 @@ mod tests {
         c.set("gap", &["12"]).unwrap();
         assert_eq!(c.get("gap").unwrap(), "12");
 
-        c.set("animation", &["0.25"]).unwrap();
-        assert_eq!(c.animation_duration, 0.25);
-        assert_eq!(c.get("animation_duration").unwrap(), "0.25");
-        c.set("animation_duration", &["0"]).unwrap();
+        assert_eq!(c.get("animation").unwrap(), "on");
+        c.set("animation", &["off"]).unwrap();
         assert_eq!(c.animation_duration, 0.0);
+        assert_eq!(c.get("animation").unwrap(), "off");
+        c.set("animation", &["on"]).unwrap();
+        assert_eq!(c.animation_duration, ANIMATION);
 
         c.set("padding", &["40", "8", "8", "8"]).unwrap();
         assert_eq!(c.get("padding").unwrap(), "40 8 8 8");
@@ -648,22 +630,23 @@ mod tests {
         assert!(c.set("gap", &["1", "2"]).is_err());
         assert!(c.set("padding", &["1", "2", "3"]).is_err());
         assert!(c.set("split_ratio", &["1.5"]).is_err());
-        assert!(c.set("animation", &["10"]).is_err());
+        assert!(c.set("animation", &["0.3"]).is_err(), "on or off only");
         assert!(c.set("colour", &["red"]).is_err());
         assert!(c.get("colour").is_err());
         assert_eq!(c, Config::default(), "failed sets change nothing");
     }
 
     #[test]
-    fn easing_setting() {
+    fn the_curve_and_speed_are_fixed() {
         let mut c = Config::default();
-        // Older configs still load; the curve is not theirs to choose now.
-        let before = c.clone();
-        c.set("animation_easing", &["ease_in_out"]).unwrap();
-        assert_eq!(c, before);
-        c.set("animation_speed", &["20"]).unwrap();
-        assert_eq!(c.animation_duration, 0.25);
-        c.set("easing", &["ease_out"]).unwrap();
+        for key in [
+            "animation_duration",
+            "animation_speed",
+            "animation_easing",
+            "easing",
+        ] {
+            assert!(c.set(key, &["1"]).is_err(), "{key}");
+        }
     }
 
     #[test]

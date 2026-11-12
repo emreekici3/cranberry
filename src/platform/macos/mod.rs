@@ -1382,10 +1382,11 @@ impl MacBackend {
             return;
         };
         let pid = win.pid;
-        // `cberry config log_level debug` traces every write: where the window
-        // was asked to go, and where the app put it after the first call and
-        // at the end.
-        let trace = log::log_enabled!(target: "cranberry::frames", log::Level::Debug);
+        // `cberry config log_level trace` traces every write: where the
+        // window was asked to go, and where the app put it after the first
+        // call and at the end. The reads wait for the app, so it slows
+        // animations down.
+        let trace = log::log_enabled!(target: "cranberry::frames", log::Level::Trace);
         self.writers.send(
             pid,
             writer::Job {

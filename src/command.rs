@@ -133,8 +133,8 @@ commands:
   retile | reload | quit
 
 settings (put these in ~/.config/cranberry/cberryrc):
-  config <key> [value]       e.g. config animation 0.25, config gap 10
-                             keys: gap, padding, animation_duration (alias animation),
+  config <key> [value]       e.g. config animation off, config gap 10
+                             keys: gap, padding, animation (on|off),
                              split_ratio, resize_step, rule_carry, poll_interval
   rule <float|tile> <app>    e.g. rule float System Settings
   rule space <space> <app>   e.g. rule space web Safari
@@ -588,10 +588,10 @@ mod tests {
         assert!(Command::parse("grid 2:2:1:0:2:1").is_err());
         assert!(Command::parse("grid 2:2:0:0:1:1 extra").is_err());
         assert_eq!(
-            Command::parse("config animation 0.25"),
+            Command::parse("config animation off"),
             Ok(Command::Config {
                 key: "animation".into(),
-                args: vec!["0.25".into()]
+                args: vec!["off".into()]
             })
         );
         assert_eq!(

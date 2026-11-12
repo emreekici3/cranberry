@@ -50,17 +50,6 @@ pub struct Manager<B: Backend> {
     closed: HashSet<WinId>,
     /// Last focused window that is part of the layout; new windows split it.
     focused: Option<WinId>,
-    /// The smallest size each window was seen to accept: it was sent a
-    /// smaller frame and stayed larger. Only this window's own refusals
-    /// count, and they are forgotten when it closes. The layout ignores
-    /// them; they only stop a command (a resize, a warp, a swap) from
-    /// putting the window over another.
-    min_sizes: MinSizes,
-    /// The layout before the user's latest run of resizes, and when the
-    /// last of them was. A window seen to refuse its size right after one
-    /// stops that resize where it fits: the first time cberry learns a
-    /// window's minimum is by going past it.
-    resize_anchor: Option<ResizeRun>,
     /// The ring on screen, if any.
     shown_border: Option<Border>,
     /// The ring is following a window the user holds by its title bar.
@@ -130,6 +119,20 @@ pub struct Manager<B: Backend> {
     /// one that came on screen), so Space rules only move new windows.
     seen: HashSet<WinId>,
     synced: bool,
+    /// Windows that would not shrink to their slot lately: the smallest
+    /// width and height each kept, and when. Resizes do not squeeze them
+    /// below that for `REFUSAL_MEMORY`, so they do not slide under their
+    /// neighbours.
+    refused: HashMap<WinId, (i32, i32, std::time::Instant)>,
+    /// Windows seen bigger than the slot they were given, at what size,
+    /// and since when: one shrinking is on its way (an app takes a moment
+    /// over a size), one that stays put has refused it.
+    oversized: HashMap<WinId, ((i32, i32), std::time::Instant)>,
+    /// The layouts before the last resizes, latest last, to step back to if
+    /// they squeezed a window below what it takes.
+    fit_back: Vec<BspTree>,
+    /// Looking at the windows a hand resize left.
+    by_hand: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -190,34 +193,25 @@ const HOLD_FOCUS_RETRY: std::time::Duration = std::time::Duration::from_millis(3
 /// The most a scratchpad left behind waits for focus to go elsewhere.
 const SCRATCH_CLOSE_WAIT: std::time::Duration = std::time::Duration::from_millis(500);
 
+/// How long a window that would not shrink is not squeezed again.
+const REFUSAL_MEMORY: std::time::Duration = std::time::Duration::from_secs(5);
+/// How much bigger than its slot a window may stay and not count as
+/// refusing it: terminals round their size up to whole cells.
+const REFUSAL_SLACK: i32 = 12;
+/// How long a window must stay bigger than its slot, at the same size, to
+/// have refused it.
+const REFUSAL_PROOF: std::time::Duration = if cfg!(test) {
+    std::time::Duration::ZERO
+} else {
+    std::time::Duration::from_millis(150)
+};
+
 /// The smallest a window can be resized to by a mouse gesture.
 const MIN_GESTURE_SIZE: i32 = 50;
 
 /// Frame differences below this many points are noise (e.g. apps rounding
 /// their size to a character grid), not a user's drag.
 const DRAG_THRESHOLD: i32 = 4;
-
-/// A window this many points larger than its slot is taken to have hit its
-/// minimum size. Large enough that an app rounding its size up to whole
-/// text cells is not mistaken for one.
-const MIN_SIZE_THRESHOLD: i32 = 24;
-
-/// The smallest width and height each window was seen to accept.
-type MinSizes = HashMap<WinId, (i32, i32)>;
-
-/// The user's latest run of resizes: the layout before the first, when the
-/// last was, and, when they were all key presses for one window and one
-/// direction, which and how far in all.
-#[derive(Clone)]
-struct ResizeRun {
-    before: BspTree,
-    at: f64,
-    keys: Option<(WinId, Direction, f32)>,
-}
-
-/// Resizes this close together are one run (a key held down); a window
-/// refusing its size this soon after the last one stops the run.
-const RESIZE_RUN_SECS: f64 = 1.0;
 
 impl<B: Backend> Manager<B> {
     pub fn new(backend: B, config: Config) -> Self {
@@ -235,8 +229,6 @@ impl<B: Backend> Manager<B> {
             float_zooms: HashMap::new(),
             closed: HashSet::new(),
             focused: None,
-            min_sizes: MinSizes::new(),
-            resize_anchor: None,
             shown_border: None,
             border_tracking: false,
             border_press: None,
@@ -268,6 +260,10 @@ impl<B: Backend> Manager<B> {
             hover: None,
             seen: HashSet::new(),
             synced: false,
+            refused: HashMap::new(),
+            oversized: HashMap::new(),
+            fit_back: Vec::new(),
+            by_hand: false,
         }
     }
 
@@ -283,7 +279,8 @@ impl<B: Backend> Manager<B> {
     /// Whether the backend wants another look soon without an event: see
     /// [`Backend::wants_another_look`].
     pub fn wants_another_look(&mut self) -> bool {
-        self.backend.wants_another_look()
+        // A window bigger than its slot: is it on its way, or refusing it?
+        self.backend.wants_another_look() || !self.oversized.is_empty()
     }
 
     pub fn tree(&self) -> &BspTree {
@@ -379,13 +376,13 @@ impl<B: Backend> Manager<B> {
     /// Syncs with the window system: picks up opened and closed windows,
     /// Space switches and display changes. Call this periodically.
     pub fn refresh(&mut self) {
-        self.sync(true);
+        self.sync();
     }
 
-    /// `refresh`, optionally without learning minimum sizes (the frames
-    /// right after a mouse resize are the user's, not the app's limits).
-    fn sync(&mut self, learn: bool) {
-        let mut dirty = false;
+    fn sync(&mut self) {
+        // Before the layout changes below: the slots now are the ones the
+        // windows were last sent to.
+        let mut dirty = self.learn_refusals();
 
         let mut displays = self.backend.displays();
         if displays.is_empty() {
@@ -552,19 +549,9 @@ impl<B: Backend> Manager<B> {
         self.closed.retain(|w| on_screen.contains(w));
         self.frames.retain(|w, _| on_screen.contains(w));
         self.apps.retain(|w, _| alive.contains(w));
-        self.min_sizes.retain(|w, _| alive.contains(w));
         if self.focused.is_some_and(|f| !self.tree.contains(f)) {
             self.focused = None;
         }
-
-        // Where the windows were sent, to see which ones would not go.
-        let mut learned = false;
-        let learn = learn && self.drag == Drag::None && !self.mouse_was_down;
-        let expected: HashMap<WinId, Rect> = if learn {
-            self.targets().into_iter().collect()
-        } else {
-            HashMap::new()
-        };
 
         // Open windows in the order the backend lists them, but put the
         // focused one last so it ends up next to where the user is looking.
@@ -580,9 +567,6 @@ impl<B: Backend> Manager<B> {
         for info in windows {
             if !self.mover.in_motion(info.id) {
                 self.frames.insert(info.id, info.frame);
-                if let Some(&slot) = expected.get(&info.id) {
-                    learned |= self.learn_min_size(info.id, slot, info.frame);
-                }
             }
             self.apps.insert(info.id, info.app.clone());
             // A window counts as seen once cberry can manage it: a new one is
@@ -647,32 +631,102 @@ impl<B: Backend> Manager<B> {
             dirty = true;
         }
 
-        // A window refused its size just after the user's resize: the resize
-        // went past it. It stops where the window fits.
-        if learned
-            && let Some(run) = self.resize_anchor.clone()
-            && self.clock - run.at <= RESIZE_RUN_SECS + 1.0
-        {
-            let now = self.tree.clone();
-            let (area, gap) = (self.inner_area(), self.config.gap);
-            let (tree, _) = match run.keys {
-                // The same keys, pressed less far.
-                Some((win, dir, total)) => self.limited_by(&run.before, &now, |t| {
-                    let mut tree = run.before.clone();
-                    tree.resize(win, dir, total * t, area, gap).then_some(tree)
-                }),
-                None => self.limited(&run.before, now),
-            };
-            if tree != self.tree {
-                debug!("the last resize went past what a window accepts; it stops there");
-                self.tree = tree;
-                dirty = true;
-            }
-        }
-
         if dirty {
             self.relayout();
         }
+    }
+
+    /// Notes windows bigger than their slot (an app's minimum size), and
+    /// when the last resize squeezed one so, takes it back. Returns whether
+    /// the layout changed.
+    fn learn_refusals(&mut self) -> bool {
+        // A window the user is dragging by hand is not refusing anything.
+        let by_hand = self.by_hand
+            || ((self.backend.mouse_down() || self.mouse_was_down)
+                && !matches!(self.drag, Drag::Gesture(_)));
+        if by_hand {
+            self.oversized.clear();
+            return false;
+        }
+        let now = std::time::Instant::now();
+        self.refused
+            .retain(|_, (.., at)| now.duration_since(*at) < REFUSAL_MEMORY);
+        let zoomed = self.zoomed.map(|(w, _)| w);
+        let mut learned = false;
+        let mut oversized = HashMap::new();
+        for (id, slot) in self.slots() {
+            // Only a window done moving says what it takes.
+            if Some(id) == zoomed || self.mover.in_motion(id) {
+                continue;
+            }
+            let Some(f) = self
+                .backend
+                .server_frame(id)
+                .or_else(|| self.backend.window_frame(id))
+            else {
+                continue;
+            };
+            let wide = f.w > slot.w + REFUSAL_SLACK;
+            let tall = f.h > slot.h + REFUSAL_SLACK;
+            if !wide && !tall {
+                continue;
+            }
+            let size = (f.w, f.h);
+            let since = match self.oversized.get(&id) {
+                Some(&(s, at)) if s == size => at,
+                _ => now,
+            };
+            oversized.insert(id, (size, since));
+            // A window changed since the last look may be one the user is
+            // resizing by hand: the look after says.
+            if now.duration_since(since) < REFUSAL_PROOF || self.frames.get(&id) != Some(&f) {
+                continue;
+            }
+            let entry = self.refused.entry(id).or_insert((0, 0, now));
+            if wide && f.w > entry.0 {
+                entry.0 = f.w;
+                learned = true;
+            }
+            if tall && f.h > entry.1 {
+                entry.1 = f.h;
+                learned = true;
+            }
+            entry.2 = now;
+        }
+        self.oversized = oversized;
+        let mut back = false;
+        if learned {
+            while self.squeezes_a_window() {
+                let Some(tree) = self.fit_back.pop() else {
+                    break;
+                };
+                self.tree = tree;
+                back = true;
+            }
+        }
+        if back {
+            debug!("a window will not get that small: the border goes back");
+        }
+        back
+    }
+
+    /// Keeps `tree`, the layout before a resize, to step back to.
+    fn remember_fit(&mut self, tree: BspTree) {
+        const KEPT: usize = 240;
+        if self.fit_back.len() >= KEPT {
+            self.fit_back.remove(0);
+        }
+        self.fit_back.push(tree);
+    }
+
+    /// Whether the layout gives a window less room than it lately kept.
+    fn squeezes_a_window(&self) -> bool {
+        self.slots().iter().any(|(id, slot)| {
+            // All the room it keeps: less, and it reaches into the gap.
+            self.refused
+                .get(id)
+                .is_some_and(|&(w, h, _)| slot.w < w || slot.h < h)
+        })
     }
 
     /// Windows found on a Space with no layout yet, as when cberry starts,
@@ -715,35 +769,6 @@ impl<B: Backend> Manager<B> {
             kept = true;
         }
         kept
-    }
-
-    /// Notes that the user is resizing: the layout before the first resize
-    /// of a run is where a resize that turns out to go too far is measured
-    /// from.
-    /// `keys`: a key press resizing that window that way that much; `None`
-    /// for the mouse.
-    fn note_resize(&mut self, before: &BspTree, keys: Option<(WinId, Direction, f32)>) {
-        let run = match self.resize_anchor.take() {
-            Some(run) if self.clock - run.at <= RESIZE_RUN_SECS => {
-                let keys = match (run.keys, keys) {
-                    (Some((w, d, total)), Some((w2, d2, more))) if w == w2 && d == d2 => {
-                        Some((w, d, total + more))
-                    }
-                    _ => None,
-                };
-                ResizeRun {
-                    at: self.clock,
-                    keys,
-                    ..run
-                }
-            }
-            _ => ResizeRun {
-                before: before.clone(),
-                at: self.clock,
-                keys,
-            },
-        };
-        self.resize_anchor = Some(run);
     }
 
     /// Tiles `id` by splitting `target` (or the last window), along the
@@ -1016,84 +1041,6 @@ impl<B: Backend> Manager<B> {
             warn!("could not send window {id} of {app} to Space {n}");
             false
         }
-    }
-
-    /// Compares where a settled window is with the slot it was sent to. One
-    /// that stayed larger has hit its minimum size; one that has since gone
-    /// below what was learned can shrink further after all.
-    fn learn_min_size(&mut self, id: WinId, slot: Rect, actual: Rect) -> bool {
-        let known = self.min_sizes.get(&id).copied().unwrap_or((0, 0));
-        let learn = |slot: i32, actual: i32, known: i32| {
-            let refused = actual > slot + MIN_SIZE_THRESHOLD && actual > known;
-            let shrank_below = known > 0 && actual < known - DRAG_THRESHOLD;
-            if refused || shrank_below {
-                actual
-            } else {
-                known
-            }
-        };
-        let min = (
-            learn(slot.w, actual.w, known.0),
-            learn(slot.h, actual.h, known.1),
-        );
-        if min == known {
-            return false;
-        }
-        info!("window {id} accepts no less than {}x{}", min.0, min.1);
-        self.min_sizes.insert(id, min);
-        true
-    }
-
-    /// The first window `after` squeezes below the size it was seen to
-    /// accept, where `before` did not squeeze it as far: a change the user
-    /// asks for must not put that window over another.
-    fn squeezed(&self, before: &BspTree, after: &BspTree) -> Option<WinId> {
-        if self.min_sizes.is_empty() {
-            return None;
-        }
-        let (area, gap) = (self.inner_area(), self.config.gap);
-        let old: HashMap<WinId, Rect> = before.layout(area, gap).into_iter().collect();
-        after.layout(area, gap).into_iter().find_map(|(id, r)| {
-            let &(min_w, min_h) = self.min_sizes.get(&id)?;
-            let was = old.get(&id);
-            let narrower = r.w < min_w && was.is_none_or(|o| r.w < o.w);
-            let shorter = r.h < min_h && was.is_none_or(|o| r.h < o.h);
-            (narrower || shorter).then_some(id)
-        })
-    }
-
-    /// `after`, a change of `before`'s ratios, cut short where it would
-    /// squeeze a window below the size it was seen to accept: as far toward
-    /// `after` as it can go. Returns the tree and the window that stopped
-    /// it, if one did.
-    fn limited(&self, before: &BspTree, after: BspTree) -> (BspTree, Option<WinId>) {
-        let step = |t: f32| before.interpolate(&after, t);
-        self.limited_by(before, &after, step)
-    }
-
-    /// Like `limited`, with `step(t)` the change made `t` of the way (0 to
-    /// 1): the furthest step that squeezes no window below what it accepts.
-    fn limited_by(
-        &self,
-        before: &BspTree,
-        after: &BspTree,
-        step: impl Fn(f32) -> Option<BspTree>,
-    ) -> (BspTree, Option<WinId>) {
-        let Some(stopper) = self.squeezed(before, after) else {
-            return (after.clone(), None);
-        };
-        let (mut fits, mut not) = (0.0_f32, 1.0_f32);
-        for _ in 0..24 {
-            let t = (fits + not) / 2.0;
-            match step(t) {
-                Some(tree) if self.squeezed(before, &tree).is_none() => fits = t,
-                Some(_) => not = t,
-                // Not a change that can stop part-way: leave it be.
-                None => return (after.clone(), Some(stopper)),
-            }
-        }
-        let tree = step(fits).unwrap_or_else(|| before.clone());
-        (tree, Some(stopper))
     }
 
     /// Reacts to window events, the only way cberry learns that something
@@ -1892,8 +1839,14 @@ impl<B: Backend> Manager<B> {
                     // The dragged edges become split borders; the layout
                     // follows, neighbours included.
                     let (area, gap) = (self.inner_area(), self.config.gap);
-                    let unchanged = self.tree.clone();
-                    self.note_resize(&unchanged, None);
+                    // A neighbour that would not shrink takes the border
+                    // back, and stops it there.
+                    if self.learn_refusals() {
+                        self.relayout_now();
+                        self.drag = Drag::Gesture(grab);
+                        return;
+                    }
+                    let before = self.tree.clone();
                     let coord = |dir| match dir {
                         Direction::Left => frame.x - gap,
                         Direction::Up => frame.y - gap,
@@ -1918,8 +1871,11 @@ impl<B: Backend> Manager<B> {
                             gap,
                         );
                     }
-                    // No further than the windows there accept.
-                    (self.tree, _) = self.limited(&unchanged, self.tree.clone());
+                    if self.squeezes_a_window() {
+                        self.tree = before;
+                    } else if self.tree != before {
+                        self.remember_fit(before);
+                    }
                     self.relayout_now();
                 } else {
                     let prev = self.frames.get(&grab.win).copied().unwrap_or(f);
@@ -1987,9 +1943,7 @@ impl<B: Backend> Manager<B> {
                         tree.swap(grab.win, other);
                     }
                 }
-                if let Some(w) = self.squeezed(&self.tree, &tree) {
-                    info!("window {w} would not fit; window {} goes back", grab.win);
-                } else {
+                {
                     match grab.side {
                         Some(side) => info!("putting window {} {side:?} of {other}", grab.win),
                         None => info!("swapping window {} with {other}", grab.win),
@@ -2084,12 +2038,8 @@ impl<B: Backend> Manager<B> {
                     Some(other) => {
                         let mut tree = self.tree.clone();
                         tree.swap(win, other);
-                        if let Some(w) = self.squeezed(&self.tree, &tree) {
-                            info!("window {w} would not fit; window {win} goes back");
-                        } else {
-                            info!("swapping window {win} with {other}");
-                            self.tree = tree;
-                        }
+                        info!("swapping window {win} with {other}");
+                        self.tree = tree;
                     }
                     None => debug!("window {win} dropped on no window; returning it"),
                 }
@@ -2097,8 +2047,11 @@ impl<B: Backend> Manager<B> {
             }
             _ => {
                 // A resize ends here: read where windows ended up, then
-                // turn the dragged edges into split borders.
-                self.sync(false);
+                // turn the dragged edges into split borders. A window bigger
+                // than its slot now is the user's doing, not its app's.
+                self.by_hand = true;
+                self.sync();
+                self.by_hand = false;
                 if self.reconcile_drag() {
                     self.relayout();
                 }
@@ -2148,7 +2101,6 @@ impl<B: Backend> Manager<B> {
         // as far as the windows there accept.
         let (area, gap) = (self.inner_area(), self.config.gap);
         let unchanged = self.tree.clone();
-        self.note_resize(&unchanged, None);
         if off(after.max_x(), before.max_x()) {
             self.tree.set_border(id, Right, after.max_x(), area, gap);
         }
@@ -2161,7 +2113,11 @@ impl<B: Backend> Manager<B> {
         if off(after.y, before.y) {
             self.tree.set_border(id, Up, after.y - gap, area, gap);
         }
-        (self.tree, _) = self.limited(&unchanged, self.tree.clone());
+        if self.squeezes_a_window() {
+            self.tree = unchanged;
+        } else {
+            self.remember_fit(unchanged);
+        }
         debug!("window {id} resized by mouse");
         true
     }
@@ -2395,9 +2351,6 @@ impl<B: Backend> Manager<B> {
                 }
                 let mut tree = self.tree.clone();
                 tree.swap(from, to);
-                if let Some(w) = self.squeezed(&self.tree, &tree) {
-                    return Err(format!("window {w} would not fit there"));
-                }
                 self.tree = tree;
                 self.warp_to(from);
             }
@@ -2450,9 +2403,6 @@ impl<B: Backend> Manager<B> {
                 if tree.layout(inner, gap) == self.tree.layout(inner, gap) {
                     tree.swap(from, to);
                 }
-                if let Some(w) = self.squeezed(&self.tree, &tree) {
-                    return Err(format!("window {w} would not fit there"));
-                }
                 if self.zoomed.is_some_and(|(w, _)| w == from || w == to) {
                     self.zoomed = None;
                 }
@@ -2473,28 +2423,15 @@ impl<B: Backend> Manager<B> {
                 let win = focused()?;
                 let before = self.slots();
                 let unchanged = self.tree.clone();
-                self.note_resize(&unchanged, Some((win, dir, amount)));
                 let (area, gap) = (self.inner_area(), self.config.gap);
                 if !self.tree.resize(win, dir, amount, area, gap) {
                     return Err("nothing to resize in that direction".into());
                 }
-                // As far as the windows there accept: the same resize, by a
-                // smaller amount (so the windows away from the border still
-                // keep their size).
-                let step = |t: f32| {
-                    let mut tree = unchanged.clone();
-                    tree.resize(win, dir, amount * t, area, gap).then_some(tree)
-                };
-                let after = self.tree.clone();
-                let (tree, stopper) = self.limited_by(&unchanged, &after, step);
-                self.tree = tree;
-                if self.slots() == before {
+                if self.slots() == before || self.squeezes_a_window() {
                     self.tree = unchanged;
-                    return Err(match stopper {
-                        Some(w) => format!("window {w} will not go smaller"),
-                        None => "the border is as far as it goes".into(),
-                    });
+                    return Err("the border is as far as it goes".into());
                 }
+                self.remember_fit(unchanged);
             }
             Command::Rotate => self.tree.rotate(),
             Command::Flip => {
@@ -2633,8 +2570,6 @@ impl<B: Backend> Manager<B> {
                 return Ok(String::new());
             }
             Command::Retile => {
-                // Also a way out if a minimum size was learned wrongly.
-                self.min_sizes.clear();
                 self.frames.clear();
                 self.refresh();
                 self.relayout();
@@ -5395,8 +5330,8 @@ pub(crate) mod tests {
         assert!(m.execute(&cmd("config gap -3")).is_err());
         assert_eq!(m.config().gap, 20);
 
-        m.execute(&cmd("config animation 0.25")).unwrap();
-        assert_eq!(m.config().animation_duration, 0.25);
+        m.execute(&cmd("config animation on")).unwrap();
+        assert_eq!(m.config().animation_duration, crate::config::ANIMATION);
 
         m.execute(&cmd("rule float Finder")).unwrap();
         assert_eq!(m.tree().windows(), vec![1]);
@@ -5830,164 +5765,46 @@ pub(crate) mod tests {
         m.backend.frame_rate = Some(1000.0);
         assert!((ms(&mut m) - 4.17).abs() < 0.01, "no faster than 240");
     }
-    /// Claude (1) over a Terminal (3) on the left, a Terminal (2) on the
-    /// right. Claude will not get narrower than 400 points.
-    fn claude_left_terminal_right() -> Manager<MockBackend> {
+    #[test]
+    fn a_window_that_will_not_shrink_is_not_squeezed_under_its_neighbour() {
+        // Claude (1) on the left will not get narrower than 400 points.
         let mut m = manager(0.0);
         m.backend.open(1, "Claude");
         m.backend.min.insert(1, (400, 0));
         m.refresh();
         m.backend.open(2, "Terminal");
         m.refresh();
-        m.backend.focused = Some(1);
         m.refresh();
-        m.backend.open(3, "Terminal");
-        m.refresh();
-        assert_eq!(m.tree().len(), 3);
-        assert_eq!(m.backend().frame(3).x, 0, "window 3 under window 1");
+        assert_eq!(m.slots()[0].1.w, 495);
         m.backend.focused = Some(2);
         m.refresh();
-        m
-    }
-
-    #[test]
-    fn resize_stops_where_a_window_will_not_go_smaller() {
-        let mut m = claude_left_terminal_right();
-        let mut overlaps = 0;
-        let mut stopped = None;
-        for _ in 0..12 {
-            match m.execute(&Command::Resize(Direction::Left, Some(0.05))) {
-                Ok(_) => {}
-                Err(e) => stopped = Some(e),
-            }
-            m.refresh(); // where the windows went
-            let (claude, right) = (m.backend().frame(1), m.backend().frame(2));
-            if claude.max_x() + 10 > right.x {
-                overlaps += 1;
-            }
-        }
-        assert!(
-            overlaps <= 1,
-            "only the first try, before it is known: {overlaps}"
-        );
-        assert_eq!(stopped.as_deref(), Some("window 1 will not go smaller"));
-        // The right Terminal grew right up to Claude, and no further.
-        let (claude, right) = (m.backend().frame(1), m.backend().frame(2));
-        assert_eq!(claude.w, 400);
-        assert_eq!(right.x, claude.max_x() + 10);
-        // One press back moves the border at once.
-        m.execute(&Command::Resize(Direction::Right, Some(0.05)))
+        // Too far: Claude stays 400 wide, under the Terminal. A look later
+        // the border goes back.
+        m.execute(&Command::Resize(Direction::Left, Some(0.2)))
             .unwrap();
-        assert!(m.backend().frame(2).x > right.x);
-    }
-
-    #[test]
-    fn the_window_that_stops_a_resize_is_not_highlighted() {
-        let mut m = claude_left_terminal_right();
-        for _ in 0..12 {
-            let _ = m.execute(&Command::Resize(Direction::Left, Some(0.05)));
+        for _ in 0..3 {
+            settle(&mut m);
             m.refresh();
         }
+        settle(&mut m);
+        assert_eq!(m.slots()[0].1.w, 495, "back where it fitted");
+        let (one, two) = (m.backend().frame(1), m.backend().frame(2));
+        assert!(one.max_x() <= two.x, "side by side: {one:?} {two:?}");
+        // And for a while, no resize squeezes it again; one that leaves it
+        // room still goes.
         assert!(
-            m.execute(&Command::Resize(Direction::Left, Some(0.05)))
+            m.execute(&Command::Resize(Direction::Left, Some(0.2)))
                 .is_err()
         );
-        assert_eq!(m.backend().overlay_changes, 0);
-    }
-
-    #[test]
-    fn a_minimum_is_learned_from_any_frame_and_kept_for_that_window_only() {
-        let mut m = manager(0.0);
-        m.backend.open(1, "Claude");
-        m.refresh();
-        // A second window halves the first: it will not go below 600.
-        m.backend.min.insert(1, (600, 0));
-        m.backend.open(2, "Terminal");
-        m.refresh();
-        m.refresh(); // the look that sees window 1 refuse
-        assert_eq!(
-            m.min_sizes.get(&1),
-            Some(&(600, 0)),
-            "learned without a resize"
-        );
-        // The layout is left alone: still pure halves.
-        assert_eq!(m.slots()[0].1.w, 495);
-        // A second Claude window knows nothing of it.
-        m.backend.open(3, "Claude");
-        m.refresh();
-        m.refresh();
-        assert_eq!(m.min_sizes.get(&3), None);
-        // Closing the window forgets it.
-        m.backend.close(1);
-        m.refresh();
-        assert_eq!(m.min_sizes.get(&1), None);
-    }
-
-    #[test]
-    fn swap_and_warp_do_not_squeeze_a_window_below_what_it_accepts() {
-        let mut m = left_one_right_two();
-        // Window 1 has the whole left half; it was seen to need 400 tall.
-        m.min_sizes.insert(1, (0, 400));
-        let before = m.tree().clone();
-        // Into window 2's place, a quarter of the screen: refused.
-        m.backend.focused = Some(1);
-        m.refresh();
-        assert_eq!(
-            m.execute(&Command::Swap(Direction::Right)),
-            Err("window 1 would not fit there".into())
-        );
-        assert_eq!(m.tree(), &before);
-        assert_eq!(m.backend().overlay_changes, 0);
-        // Window 3 warped into window 1's place would halve window 1.
-        m.backend.focused = Some(3);
-        m.refresh();
-        assert!(m.execute(&Command::Warp(Direction::Left)).is_err());
-        assert_eq!(m.tree(), &before);
-        // Without what was learned, both go ahead as before.
-        m.min_sizes.clear();
-        m.execute(&Command::Warp(Direction::Left)).unwrap();
-    }
-    #[test]
-    fn the_middle_window_grows_alone_up_to_its_neighbours_minimum() {
-        // Three side by side on a wide screen: 1 | (2 | 3).
-        let mut m = manager(0.0);
-        m.backend.area = Rect::new(0, 25, 1800, 600);
-        m.backend.open(1, "Claude");
-        m.backend.min.insert(1, (500, 0));
-        m.refresh();
-        m.backend.open(2, "Terminal");
-        m.refresh();
-        m.backend.focused = Some(2);
-        m.refresh();
-        m.backend.open(3, "Terminal");
-        m.refresh();
-        // Dropped beside window 2 with the insert modifier, as by hand.
-        m.tree.remove(3);
-        m.tree.insert_at(3, 2, Direction::Right);
-        m.relayout();
-        m.backend.focused = Some(2);
-        m.focused = Some(2);
-        m.refresh();
-        let right = m.backend().frame(3);
-        assert!(m.backend().frame(1).max_x() < m.backend().frame(2).x);
-        assert!(m.backend().frame(2).max_x() < right.x, "three columns");
-        // The middle one grows to the left, a key press at a time.
-        let mut stopped = false;
-        for _ in 0..15 {
-            stopped |= m
-                .execute(&Command::Resize(Direction::Left, Some(0.05)))
-                .is_err();
-            m.refresh();
-            assert_eq!(
-                m.backend().frame(3),
-                right,
-                "the right window does not move"
-            );
-        }
-        assert!(stopped);
+        m.execute(&Command::Resize(Direction::Left, Some(0.05)))
+            .unwrap();
+        assert!(m.slots()[0].1.w >= 400, "with the gap kept");
         let (one, two) = (m.backend().frame(1), m.backend().frame(2));
-        assert_eq!(one.w, 500, "window 1 at its minimum");
-        assert_eq!(two.x, one.max_x() + 10, "window 2 right against it");
+        assert!(one.max_x() + 10 <= two.x, "{one:?} {two:?}");
+        // The Terminal may be squeezed as before.
+        m.execute(&Command::Resize(Direction::Right, Some(0.3)))
+            .unwrap();
+        assert!(m.slots()[1].1.w < 400);
     }
 
     fn run(m: &mut Manager<MockBackend>, line: &str) -> Result<String, String> {

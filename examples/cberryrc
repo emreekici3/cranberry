@@ -7,8 +7,8 @@
 cberry config gap 8
 cberry config padding 8 8 8 8
 
-# How long a window takes to slide into place, in seconds (0 = off).
-cberry config animation 0.25
+# Windows slide into place (0.25 s, macOS's curve), or jump with off.
+cberry config animation on
 
 # Share the old window keeps when a new one splits it.
 cberry config split_ratio 0.5

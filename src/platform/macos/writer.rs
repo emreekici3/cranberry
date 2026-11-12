@@ -16,7 +16,7 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use log::{debug, warn};
+use log::{debug, trace, warn};
 
 use super::ffi::*;
 use super::{Cf, Step, cfstring, read_frame, set_attr};
@@ -232,7 +232,7 @@ fn write(job: &Job, position: &Cf, size: &Cf) {
                 Step::Size => "size",
             })
             .collect();
-        debug!(
+        trace!(
             target: "cranberry::frames",
             "window {} {}: want {} | between {} | after {}",
             job.id,
