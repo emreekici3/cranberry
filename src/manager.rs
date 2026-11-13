@@ -2170,10 +2170,10 @@ impl<B: Backend> Manager<B> {
             .inset(&self.config.padding)
     }
 
-    /// `cberry resize` for a floating window: the rule of tiled ones, with
-    /// the display's edges for the screen's. `dir` moves its left (top)
-    /// edge, or its right (bottom) one when it is against the left (top) of
-    /// the display, by `amount` of the display.
+    /// `cberry resize` for a floating window, by axis: the top-left corner
+    /// stays, `right` and `down` grow it, `left` and `up` shrink it, by
+    /// `amount` of the display. It grows no further than the display's edge
+    /// and shrinks no smaller than a gesture leaves it.
     fn resize_floating(&mut self, win: WinId, dir: Direction, amount: f32) -> Result<(), String> {
         let now = self
             .heading_of(win)
@@ -2183,18 +2183,20 @@ impl<B: Backend> Manager<B> {
         }
         let area = self.inner_area_around(now);
         let step = |len: i32| (len as f32 * amount).round() as i32;
-        let (mut left, mut top, mut right, mut bottom) = (now.x, now.y, now.max_x(), now.max_y());
+        // A length grown or shrunk by `delta`, never past `room` nor below
+        // the smallest size, unless it already was.
+        let len = |now: i32, room: i32, delta: i32| {
+            (now + delta)
+                .min(room.max(now))
+                .max(MIN_GESTURE_SIZE.min(now))
+        };
+        let mut frame = now;
         match dir {
-            Direction::Left => {
-                move_edge(&mut left, &mut right, area.x, area.max_x(), -step(area.w))
-            }
-            Direction::Right => {
-                move_edge(&mut left, &mut right, area.x, area.max_x(), step(area.w))
-            }
-            Direction::Up => move_edge(&mut top, &mut bottom, area.y, area.max_y(), -step(area.h)),
-            Direction::Down => move_edge(&mut top, &mut bottom, area.y, area.max_y(), step(area.h)),
+            Direction::Right => frame.w = len(now.w, area.max_x() - now.x, step(area.w)),
+            Direction::Left => frame.w = len(now.w, area.max_x() - now.x, -step(area.w)),
+            Direction::Down => frame.h = len(now.h, area.max_y() - now.y, step(area.h)),
+            Direction::Up => frame.h = len(now.h, area.max_y() - now.y, -step(area.h)),
         }
-        let frame = Rect::new(left, top, right - left, bottom - top);
         if frame == now {
             return Err("the border is as far as it goes".into());
         }
@@ -2889,17 +2891,6 @@ fn zoom_rect(
         Zoom::Parent => tree.parent_rect(win, area, gap)?,
     };
     Some((win, rect))
-}
-
-/// Moves the near edge of the span `start..end` by `delta`, or its far edge
-/// when it is against `lo`; within `lo..hi` and no smaller than a gesture
-/// leaves a window (a span already outside stays where it is on that side).
-fn move_edge(start: &mut i32, end: &mut i32, lo: i32, hi: i32, delta: i32) {
-    if *start <= lo {
-        *end = (*end + delta).clamp((*start + MIN_GESTURE_SIZE).min(*end), hi.max(*end));
-    } else {
-        *start = (*start + delta).clamp(lo.min(*start), (*end - MIN_GESTURE_SIZE).max(*start));
-    }
 }
 
 #[cfg(test)]
@@ -5040,7 +5031,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn resize_moves_a_floating_windows_edges_as_a_tiled_ones() {
+    fn resize_grows_and_shrinks_a_floating_window_by_axis() {
         let mut m = manager(0.0);
         m.backend.open(1, "Terminal");
         m.backend.open(2, "Notes");
@@ -5055,20 +5046,24 @@ pub(crate) mod tests {
         let resize = |m: &mut Manager<MockBackend>, dir| {
             m.execute(&Command::Resize(dir, Some(0.1))).unwrap();
         };
-        resize(&mut m, Direction::Left);
-        assert_eq!(m.backend().frame(3), Rect::new(150, 175, 600, 300));
+        // The top-left corner stays: right and down grow, left and up shrink.
         resize(&mut m, Direction::Right);
+        assert_eq!(m.backend().frame(3), Rect::new(250, 175, 600, 300));
+        resize(&mut m, Direction::Left);
         assert_eq!(m.backend().frame(3), start);
-        resize(&mut m, Direction::Up);
-        assert_eq!(m.backend().frame(3), Rect::new(250, 115, 500, 360));
+        resize(&mut m, Direction::Left);
+        assert_eq!(m.backend().frame(3), Rect::new(250, 175, 400, 300));
         resize(&mut m, Direction::Down);
-        assert_eq!(m.backend().frame(3), start);
+        assert_eq!(m.backend().frame(3), Rect::new(250, 175, 400, 360));
+        resize(&mut m, Direction::Up);
+        resize(&mut m, Direction::Up);
+        assert_eq!(m.backend().frame(3), Rect::new(250, 175, 400, 240));
         // The tiled windows were not the ones meant.
         assert_eq!(m.backend().frame(1), tiled);
     }
 
     #[test]
-    fn resize_moves_the_far_edge_of_a_floating_window_at_the_display_edge() {
+    fn resize_keeps_a_floating_windows_top_left_corner_at_the_display_edge() {
         let mut m = manager(0.0);
         m.backend.open(1, "Notes");
         m.refresh();
@@ -5089,9 +5084,13 @@ pub(crate) mod tests {
         m.refresh();
         m.backend.focused = Some(1);
         m.execute(&Command::Grid([1, 1, 0, 0, 1, 1])).unwrap();
-        // Already as wide as the display.
+        // Already as wide and as tall as the display.
         assert!(
             m.execute(&Command::Resize(Direction::Right, Some(0.1)))
+                .is_err()
+        );
+        assert!(
+            m.execute(&Command::Resize(Direction::Down, Some(0.1)))
                 .is_err()
         );
         // Never below the smallest size a gesture leaves.
@@ -5121,15 +5120,15 @@ pub(crate) mod tests {
         assert_ne!(between, start);
         assert_ne!(between, cell);
         // A key pressed twice in flight adds up from where it is heading.
-        m.execute(&Command::Resize(Direction::Left, Some(0.1)))
+        m.execute(&Command::Resize(Direction::Right, Some(0.1)))
             .unwrap();
-        m.execute(&Command::Resize(Direction::Left, Some(0.1)))
+        m.execute(&Command::Resize(Direction::Right, Some(0.1)))
             .unwrap();
         settle(&mut m);
-        assert_eq!(m.backend().frame(2), Rect::new(50, 175, 700, 300));
+        assert_eq!(m.backend().frame(2), Rect::new(250, 175, 700, 300));
         // Polls leave it there.
         m.refresh();
-        assert_eq!(m.backend().frame(2), Rect::new(50, 175, 700, 300));
+        assert_eq!(m.backend().frame(2), Rect::new(250, 175, 700, 300));
     }
 
     #[test]
@@ -5278,6 +5277,29 @@ pub(crate) mod tests {
 
         m.execute(&Command::parse("layout 1 bsp").unwrap()).unwrap();
         assert_eq!(m.tree().len(), 3);
+    }
+
+    #[test]
+    fn resize_in_a_floating_space_goes_by_axis() {
+        let mut m = three_spaces();
+        m.backend.open(1, "Terminal");
+        m.backend.open(2, "Notes");
+        m.refresh();
+        m.execute(&Command::parse("layout general float").unwrap())
+            .unwrap();
+        m.backend.focused = Some(1);
+        let start = m.backend().frame(1);
+        let resize = |m: &mut Manager<MockBackend>, cmd: &str| {
+            m.execute(&Command::parse(cmd).unwrap())
+        };
+        resize(&mut m, "resize left 0.1").unwrap();
+        assert_eq!(m.backend().frame(1), Rect::new(start.x, start.y, start.w - 100, start.h));
+        resize(&mut m, "resize up 0.1").unwrap();
+        assert_eq!(m.backend().frame(1), Rect::new(start.x, start.y, start.w - 100, start.h - 60));
+        resize(&mut m, "resize right 0.1").unwrap();
+        resize(&mut m, "resize down 0.1").unwrap();
+        assert_eq!(m.backend().frame(1), start);
+        assert!(resize(&mut m, "resize down 0.1").is_err(), "the display's bottom");
     }
 
     #[test]

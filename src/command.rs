@@ -31,7 +31,9 @@ pub enum Command {
     /// splits as it would for a new window, and the window keeps the side
     /// it came from.
     Warp(Direction),
-    /// Move a border of the focused window; amount defaults to `resize_step`.
+    /// Move a border of the focused window, or for a floating one grow
+    /// (`right`, `down`) or shrink (`left`, `up`) it from its top-left
+    /// corner; amount defaults to `resize_step`.
     Resize(Direction, Option<f32>),
     /// Rotate the whole layout 90° clockwise.
     Rotate,
