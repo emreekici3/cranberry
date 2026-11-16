@@ -336,6 +336,11 @@ impl<B: Backend> Manager<B> {
         self.backend.stop_frames();
     }
 
+    /// The main loop went round once: see [`Backend::end_turn`].
+    pub fn end_turn(&mut self) {
+        self.backend.end_turn();
+    }
+
     /// Applies new settings. Windows of apps that became floating leave the
     /// layout right away; those that may be tiled again join at the next poll.
     pub fn set_config(&mut self, config: Config) {

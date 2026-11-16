@@ -1126,6 +1126,9 @@ struct TrackedWindow {
 const MAX_LOOKUPS: u8 = 20;
 
 pub struct MacBackend {
+    /// The autorelease pool of the main loop's current turn (see
+    /// `end_turn`).
+    pool: *mut c_void,
     names: Names,
     system: Cf,
     apps: HashMap<i32, AppHandle>,
@@ -1186,6 +1189,7 @@ impl MacBackend {
         events::start();
         unsafe { AXUIElementSetMessagingTimeout(system.ptr(), 0.25) };
         Self {
+            pool: unsafe { objc_autoreleasePoolPush() },
             names: Names::new(),
             system,
             apps: HashMap::new(),
@@ -1910,6 +1914,18 @@ impl Backend for MacBackend {
 
     fn stop_frames(&mut self) {
         self.vsync.stop();
+    }
+
+    fn end_turn(&mut self) {
+        // The main loop is not an AppKit run loop, so nothing drains what
+        // AppKit, Core Animation and notification delivery autorelease along
+        // the way: without a pool per turn it piles up for as long as cberry
+        // runs. The pools pushed elsewhere are popped before they return, so
+        // this one is always the innermost here.
+        unsafe {
+            objc_autoreleasePoolPop(self.pool);
+            self.pool = objc_autoreleasePoolPush();
+        }
     }
 
     fn frame_rate(&mut self) -> Option<f64> {

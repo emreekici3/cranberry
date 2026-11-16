@@ -211,6 +211,8 @@ pub fn run<B: Backend>(
             }
         }
 
+        manager.end_turn();
+
         // Sleep only what is left of the frame, so frames stay evenly spaced
         // however long this one's work took. The windows are written by
         // their apps' own threads, so a slow app does not make it late.

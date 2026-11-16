@@ -166,6 +166,9 @@ pub trait Backend {
     }
     /// Nothing is moving any more.
     fn stop_frames(&mut self) {}
+    /// Called at the end of every turn of the main loop: lets go of what
+    /// the turn left for the system to free later.
+    fn end_turn(&mut self) {}
     /// The display's highest refresh rate, in frames per second, to pace
     /// animations to; `None` if unknown.
     fn frame_rate(&mut self) -> Option<f64> {
