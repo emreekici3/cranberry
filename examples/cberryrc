@@ -1,5 +1,6 @@
 #!/bin/sh
-# cberry config, run by `cberry start` (and again by `cberry reload`).
+# cberry config, run whenever cberry starts: at login, on `cberry start`, and on
+# `cberry reload`, which starts it over so removed lines take effect too.
 # Copy to ~/.config/cranberry/cberryrc. Every line is an ordinary cberry command,
 # so you can also try them live in a terminal first.
 
