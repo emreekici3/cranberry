@@ -62,7 +62,7 @@
 | `cberry install` / `uninstall` | Add or remove the login service |
 | `cberry start` / `stop` / `restart` | Control the service |
 | `cberry run` | Run in the terminal instead of as a service |
-| `cberry reload` | Reload the config |
+| `cberry reload` | Reload the config: cberry starts over, so the layout is read again from where the windows are |
 | `cberry config <key> [value]` | Show or change a setting |
 | `cberry bind ['<hotkey>']` | Add a keyboard shortcut; alone, list them |
 | `cberry query [--json\|--spaces]` | List windows with their app names, or the Spaces as JSON |

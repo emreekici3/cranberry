@@ -15,6 +15,16 @@ use crate::manager::Manager;
 use crate::motion::paced;
 use crate::platform::Backend;
 
+/// Why [`run`] returned.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Exit {
+    /// A `quit` command, or `stop` was set.
+    Quit,
+    /// A `reload` command. The caller starts cberry over in a fresh process,
+    /// so the config is read from scratch and nothing from before is left.
+    Reload,
+}
+
 /// Loop interval when nothing is moving. While something is, the loop
 /// runs at the display's refresh rate (`Manager::frame_interval`).
 const IDLE_FRAME: Duration = Duration::from_millis(16);
@@ -110,7 +120,7 @@ pub fn run<B: Backend>(
     rc_path: Option<PathBuf>,
     server: Server,
     stop: Arc<AtomicBool>,
-) {
+) -> Exit {
     let mut manager = Manager::new(backend, Config::default());
 
     let mut rc = rc_path.as_deref().and_then(RcScript::spawn);
@@ -134,11 +144,11 @@ pub fn run<B: Backend>(
             match cmd {
                 Command::Quit => {
                     stop.store(true, Ordering::Relaxed);
-                    Ok("bye".into())
+                    Ok("bye\n".into())
                 }
                 Command::Reload => {
                     reload = true;
-                    Ok("reloading".into())
+                    Ok("reloading\n".into())
                 }
                 cmd => manager.execute(&cmd),
             }
@@ -151,11 +161,10 @@ pub fn run<B: Backend>(
             }
         }
         if reload {
-            // Start from the defaults so removed lines take effect too.
-            manager.set_config(Config::default());
-            let path = Config::find_rc();
-            rc = path.as_deref().and_then(RcScript::spawn);
-            info!("config reloaded");
+            // Applying a new config in place could leave state from the old
+            // one behind; starting over leaves nothing behind.
+            info!("reloading: starting over");
+            return Exit::Reload;
         }
 
         let rc_running = rc.as_mut().is_some_and(RcScript::pending);
@@ -227,6 +236,7 @@ pub fn run<B: Backend>(
         }
     }
     info!("stopping");
+    Exit::Quit
 }
 
 /// Logs a fatal startup error and exits.

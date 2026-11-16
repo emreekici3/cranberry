@@ -128,12 +128,20 @@ fn run() -> ExitCode {
         log::info!("config: {}", p.display());
     }
     let server = ipc::Server::bind(&ipc::socket_path()).unwrap_or_else(|e| daemon::fail(e));
-    daemon::run(
+    let exit = daemon::run(
         MacBackend::new(),
         rc,
         server,
         Arc::new(AtomicBool::new(false)),
     );
+    if exit == daemon::Exit::Reload {
+        // In place: same process id, so launchd keeps its service, and the
+        // same output, so the log carries on.
+        use std::os::unix::process::CommandExt;
+        let exe = std::env::current_exe().unwrap_or_else(|e| daemon::fail(e));
+        let err = std::process::Command::new(exe).arg("run").exec();
+        daemon::fail(format!("cannot reload cberry: {err}"));
+    }
     ExitCode::SUCCESS
 }
 
