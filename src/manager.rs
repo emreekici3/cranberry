@@ -128,6 +128,9 @@ pub struct Manager<B: Backend> {
     /// and since when: one shrinking is on its way (an app takes a moment
     /// over a size), one that stays put has refused it.
     oversized: HashMap<WinId, ((i32, i32), std::time::Instant)>,
+    /// Windows that settled smaller than their slot, at the size last
+    /// logged.
+    short: HashMap<WinId, (i32, i32)>,
     /// The layouts before the last resizes, latest last, to step back to if
     /// they squeezed a window below what it takes.
     fit_back: Vec<BspTree>,
@@ -198,6 +201,9 @@ const REFUSAL_MEMORY: std::time::Duration = std::time::Duration::from_secs(5);
 /// How much bigger than its slot a window may stay and not count as
 /// refusing it: terminals round their size up to whole cells.
 const REFUSAL_SLACK: i32 = 12;
+/// How much smaller than its slot a window may settle and not be logged:
+/// terminals round their size down to whole cells.
+const SHORT_SLACK: i32 = 24;
 /// How long a window must stay bigger than its slot, at the same size, to
 /// have refused it.
 const REFUSAL_PROOF: std::time::Duration = if cfg!(test) {
@@ -262,6 +268,7 @@ impl<B: Backend> Manager<B> {
             synced: false,
             refused: HashMap::new(),
             oversized: HashMap::new(),
+            short: HashMap::new(),
             fit_back: Vec::new(),
             by_hand: false,
         }
@@ -659,7 +666,9 @@ impl<B: Backend> Manager<B> {
         let zoomed = self.zoomed.map(|(w, _)| w);
         let mut learned = false;
         let mut oversized = HashMap::new();
-        for (id, slot) in self.slots() {
+        let slots = self.slots();
+        self.short.retain(|id, _| slots.iter().any(|(s, _)| s == id));
+        for (id, slot) in slots {
             // Only a window done moving says what it takes.
             if Some(id) == zoomed || self.mover.in_motion(id) {
                 continue;
@@ -671,6 +680,7 @@ impl<B: Backend> Manager<B> {
             else {
                 continue;
             };
+            self.note_short(id, slot, f);
             let wide = f.w > slot.w + REFUSAL_SLACK;
             let tall = f.h > slot.h + REFUSAL_SLACK;
             if !wide && !tall {
@@ -721,6 +731,33 @@ impl<B: Backend> Manager<B> {
             debug!("a window will not get that small: the border goes back");
         }
         back
+    }
+
+    /// Logs, once a size, a window that settled smaller than its slot:
+    /// macOS or the app cut it short, as some do to keep clear of a Dock
+    /// they wrongly think is shown.
+    fn note_short(&mut self, id: WinId, slot: Rect, f: Rect) {
+        // Still on its way there.
+        if self.frames.get(&id) != Some(&f) {
+            return;
+        }
+        if slot.w - f.w <= SHORT_SLACK && slot.h - f.h <= SHORT_SLACK {
+            self.short.remove(&id);
+            return;
+        }
+        if self.short.insert(id, (f.w, f.h)) != Some((f.w, f.h)) {
+            info!(
+                "window {id} stays short of its slot: {}x{} at y {}..{} for {}x{} at y {}..{}",
+                f.w,
+                f.h,
+                f.y,
+                f.max_y(),
+                slot.w,
+                slot.h,
+                slot.y,
+                slot.max_y()
+            );
+        }
     }
 
     /// Keeps `tree`, the layout before a resize, to step back to.
@@ -2936,6 +2973,9 @@ pub(crate) mod tests {
         pub events: Vec<WindowEvent>,
         /// Windows that refuse to get smaller than this, like real apps.
         pub min: HashMap<WinId, (i32, i32)>,
+        /// Windows that will not get taller than this, as apps cut short
+        /// by a Dock they wrongly think is shown.
+        pub max_h: HashMap<WinId, i32>,
         /// The gesture modifier cberry asked for.
         pub modifier: Option<Modifier>,
         /// Modifier keys held down.
@@ -3050,7 +3090,13 @@ pub(crate) mod tests {
             self.writes.push(id);
             self.in_flight.push(false);
             if let Some(w) = self.windows.iter_mut().find(|w| w.id == id) {
-                w.frame = Rect::new(frame.x, frame.y, frame.w.max(min_w), frame.h.max(min_h));
+                let max_h = self.max_h.get(&id).copied().unwrap_or(i32::MAX);
+                w.frame = Rect::new(
+                    frame.x,
+                    frame.y,
+                    frame.w.max(min_w),
+                    frame.h.max(min_h).min(max_h),
+                );
             }
         }
         fn mouse_down(&mut self) -> bool {
@@ -5856,6 +5902,34 @@ pub(crate) mod tests {
         }
         assert!(m.refused.contains_key(&1));
         assert!(!m.wants_another_look(), "learned, and done looking");
+    }
+
+    #[test]
+    fn a_window_cut_short_of_its_slot_is_noted() {
+        // Ghostty (1) will not get taller than 400 points, as if the Dock
+        // were in the way.
+        let mut m = manager(0.0);
+        m.backend.open(1, "Ghostty");
+        m.backend.max_h.insert(1, 400);
+        m.backend.open(2, "Safari");
+        for _ in 0..3 {
+            m.refresh();
+        }
+        let slot = m.slots().into_iter().find(|(id, _)| *id == 1).unwrap().1;
+        assert!(slot.h > 400 + SHORT_SLACK, "side by side, full height");
+        assert_eq!(m.short.get(&1), Some(&(slot.w, 400)));
+        assert!(!m.short.contains_key(&2));
+        // Stacked, each half fits: nothing to note.
+        m.backend.focused = Some(1);
+        m.refresh();
+        m.execute(&Command::Rotate).unwrap();
+        for _ in 0..3 {
+            settle(&mut m);
+            m.refresh();
+        }
+        let slot = m.slots().into_iter().find(|(id, _)| *id == 1).unwrap().1;
+        assert!(slot.h <= 400, "stacked: {slot:?}");
+        assert!(m.short.is_empty(), "{:?}", m.short);
     }
 
     #[test]

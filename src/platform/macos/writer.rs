@@ -221,7 +221,17 @@ fn write(job: &Job, position: &Cf, size: &Cf) {
         let edges = |r: Option<Rect>| {
             r.map_or_else(
                 || "?".to_string(),
-                |r| format!("{}..{} w{}", r.x, r.max_x(), r.w),
+                |r| {
+                    format!(
+                        "{}..{} w{} {}..{} h{}",
+                        r.x,
+                        r.max_x(),
+                        r.w,
+                        r.y,
+                        r.max_y(),
+                        r.h
+                    )
+                },
             )
         };
         let order: Vec<&str> = job
