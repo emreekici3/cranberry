@@ -2,6 +2,8 @@
 
 A BSP tiling window manager for macOS.
 
+https://github.com/user-attachments/assets/3a0c580d-7fc2-4a4c-930d-ed44878b5bf9
+
 ## Why cranberry?
 
 - **No SIP to disable.** Switching Spaces, sending windows to another Space and
