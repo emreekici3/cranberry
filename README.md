@@ -2,6 +2,22 @@
 
 A BSP tiling window manager for macOS.
 
+## Why cranberry?
+
+- **No SIP to disable.** Switching Spaces, sending windows to another Space and
+  moving them between displays all work with System Integrity Protection on.
+- **macOS's own Spaces.** Your Spaces stay the ones Mission Control shows, with
+  labels (`cberry space web`) and rules that send an app's windows where they belong.
+- **Shortcuts built in.** `cberry bind 'alt - h : cberry focus left'` in your config
+  is all it takes; no separate hotkey daemon, and `cberry` commands run without
+  starting a process.
+- **Smooth.** Windows slide into place on macOS's own animation curve.
+- **The mouse works too.** Hold a key to move or resize any window, drag one onto
+  another to swap them or split it, and turn on focus follows mouse if you like.
+- **Floating when you want it.** Scratchpads for an app you want at hand on every
+  Space, grid placement for floating windows, and a whole Space can stay untiled.
+- **One config file**, a plain shell script, and `cberry doctor` when something is off.
+
 ## Install
 
 ```sh
