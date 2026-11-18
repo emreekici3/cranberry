@@ -1534,13 +1534,23 @@ impl<B: Backend> Manager<B> {
     }
 
     /// The frontmost window cberry manages at a point, from the last poll.
-    /// Helper windows that only look like windows are looked through.
+    /// Helper windows that only look like windows are looked through, but
+    /// not those of the app with the focus: its pop-ups, overlays and
+    /// panels are what the user is working with, so none behind them.
     fn window_under(&self, x: f32, y: f32) -> Option<WinId> {
-        self.stack
-            .iter()
-            .copied()
-            .filter(|id| self.manageable.contains(id) || self.is_tiled_anywhere(*id))
-            .find(|id| self.frames.get(id).is_some_and(|f| f.contains_point(x, y)))
+        let focused_app = self.reported_focus.and_then(|w| self.apps.get(&w));
+        for &id in &self.stack {
+            if !self.frames.get(&id).is_some_and(|f| f.contains_point(x, y)) {
+                continue;
+            }
+            if self.manageable.contains(&id) || self.is_tiled_anywhere(id) {
+                return Some(id);
+            }
+            if focused_app.is_some() && self.apps.get(&id) == focused_app {
+                return None;
+            }
+        }
+        None
     }
 
     /// Mouse follows focus: puts the pointer in the middle of `win`'s slot,
@@ -4403,6 +4413,38 @@ pub(crate) mod tests {
         assert_eq!(m.tree().windows(), vec![1, 2]);
         hover(&mut m, (100.0, 300.0), 0.1);
         hover(&mut m, (700.0, 300.0), 0.3);
+        assert_eq!(m.backend().focus_calls, vec![2]);
+    }
+
+    #[test]
+    fn focus_follows_mouse_stops_at_a_popup_of_the_focused_app() {
+        let mut m = ffm();
+        m.backend.open(1, "WhatsApp");
+        m.backend.open(2, "Telegram");
+        m.refresh();
+        m.backend.focused = Some(1);
+        m.refresh();
+        assert_eq!(m.tree().windows(), vec![1, 2]);
+        // WhatsApp's emoji pop-up (or PowerPoint's presenter overlay): not
+        // a window cberry manages, and reaching over Telegram's half.
+        m.backend.windows.insert(
+            0,
+            WindowInfo {
+                id: 60,
+                frame: Rect::new(400, 200, 250, 150),
+                app: "WhatsApp".into(),
+                tileable: false,
+                movable: false,
+            },
+        );
+        m.refresh();
+        hover(&mut m, (100.0, 300.0), 0.1);
+        hover(&mut m, (550.0, 250.0), 0.3);
+        assert!(
+            m.backend().focus_calls.is_empty(),
+            "Telegram behind the pop-up"
+        );
+        hover(&mut m, (700.0, 500.0), 0.3);
         assert_eq!(m.backend().focus_calls, vec![2]);
     }
 
