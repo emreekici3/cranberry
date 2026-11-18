@@ -1801,6 +1801,13 @@ impl Backend for MacBackend {
         covered_at(x, y)
     }
 
+    fn front_window_at(&mut self, x: f32, y: f32) -> Option<WinId> {
+        cg_windows(true)
+            .into_iter()
+            .find(|w| w.frame.contains_point(x, y))
+            .map(|w| w.id)
+    }
+
     fn panel_has_focus(&mut self) -> bool {
         let pid = copy_attr(self.system.ptr(), &self.names.focused_application).and_then(|app| {
             let mut pid = 0;

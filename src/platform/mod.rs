@@ -196,6 +196,11 @@ pub trait Backend {
     fn covered_at(&mut self, _x: f32, _y: f32) -> bool {
         false
     }
+    /// The frontmost normal window at a point, read right now: one may
+    /// have opened since the last look at the window list.
+    fn front_window_at(&mut self, _x: f32, _y: f32) -> Option<WinId> {
+        None
+    }
     /// Sets the modifier key that turns a click anywhere on a window into a
     /// window gesture (`None` turns gestures off).
     fn set_mouse_modifier(&mut self, _modifier: Option<Modifier>) {}

@@ -1563,6 +1563,16 @@ impl<B: Backend> Manager<B> {
             debug!("focus follows mouse: window {win} is behind a menu");
             return;
         }
+        // The window list is from the last look; a pop-up may have opened
+        // over the window since. Wait for the next look to say what it is.
+        if let Some(front) = self.backend.front_window_at(x, y)
+            && front != win
+            && !self.looked_through(front)
+        {
+            debug!("focus follows mouse: window {front} is in front of window {win}; waiting");
+            self.hover = Some((win, self.clock));
+            return;
+        }
         debug!("focus follows mouse: window {win}");
         self.backend.focus(win);
         if tiled && self.bring_display_of(win) {
@@ -1575,19 +1585,24 @@ impl<B: Backend> Manager<B> {
     /// not those of the app with the focus: its pop-ups, overlays and
     /// panels are what the user is working with, so none behind them.
     fn window_under(&self, x: f32, y: f32) -> Option<WinId> {
-        let focused_app = self.reported_focus.and_then(|w| self.apps.get(&w));
-        for &id in &self.stack {
-            if !self.frames.get(&id).is_some_and(|f| f.contains_point(x, y)) {
-                continue;
-            }
-            if self.manageable.contains(&id) || self.is_tiled_anywhere(id) {
-                return Some(id);
-            }
-            if focused_app.is_some() && self.apps.get(&id) == focused_app {
-                return None;
-            }
+        let id = self
+            .stack
+            .iter()
+            .copied()
+            .filter(|id| self.frames.get(id).is_some_and(|f| f.contains_point(x, y)))
+            .find(|id| !self.looked_through(*id))?;
+        (self.manageable.contains(&id) || self.is_tiled_anywhere(id)).then_some(id)
+    }
+
+    /// Whether the pointer looks through a window to the one behind: a
+    /// helper window from the last poll, of an app without the focus.
+    fn looked_through(&self, id: WinId) -> bool {
+        if !self.stack.contains(&id) || self.manageable.contains(&id) || self.is_tiled_anywhere(id)
+        {
+            return false;
         }
-        None
+        let focused_app = self.reported_focus.and_then(|w| self.apps.get(&w));
+        focused_app.is_none() || self.apps.get(&id) != focused_app
     }
 
     /// Mouse follows focus: puts the pointer in the middle of `win`'s slot,
@@ -3164,6 +3179,12 @@ pub(crate) mod tests {
         fn covered_at(&mut self, x: f32, y: f32) -> bool {
             self.menu.is_some_and(|m| m.contains_point(x, y))
         }
+        fn front_window_at(&mut self, x: f32, y: f32) -> Option<WinId> {
+            self.windows
+                .iter()
+                .find(|w| w.frame.contains_point(x, y))
+                .map(|w| w.id)
+        }
         fn panel_has_focus(&mut self) -> bool {
             self.panel
         }
@@ -4490,6 +4511,39 @@ pub(crate) mod tests {
             m.backend().focus_calls.is_empty(),
             "Telegram behind the pop-up"
         );
+        hover(&mut m, (700.0, 500.0), 0.3);
+        assert_eq!(m.backend().focus_calls, vec![2]);
+    }
+
+    #[test]
+    fn focus_follows_mouse_waits_for_a_popup_not_yet_seen() {
+        let mut m = ffm();
+        m.backend.open(1, "WhatsApp");
+        m.backend.open(2, "Telegram");
+        m.refresh();
+        m.backend.focused = Some(1);
+        m.refresh();
+        hover(&mut m, (100.0, 300.0), 0.1);
+        // The pop-up opens, and the pointer is on it before cberry has
+        // looked at the window list again.
+        m.backend.windows.insert(
+            0,
+            WindowInfo {
+                id: 60,
+                frame: Rect::new(400, 200, 250, 150),
+                app: "WhatsApp".into(),
+                tileable: false,
+                movable: false,
+            },
+        );
+        hover(&mut m, (550.0, 250.0), 0.6);
+        assert!(
+            m.backend().focus_calls.is_empty(),
+            "Telegram behind the pop-up"
+        );
+        m.refresh();
+        hover(&mut m, (551.0, 250.0), 0.6);
+        assert!(m.backend().focus_calls.is_empty());
         hover(&mut m, (700.0, 500.0), 0.3);
         assert_eq!(m.backend().focus_calls, vec![2]);
     }
