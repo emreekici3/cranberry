@@ -5021,6 +5021,31 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn a_window_sent_between_two_side_by_side_spaces_stays_in_two_columns() {
+        let mut m = three_spaces();
+        m.backend.active = 30;
+        m.backend.open(4, "Zed");
+        m.refresh();
+        m.backend.open(5, "Finder");
+        m.refresh();
+        m.backend.active = 10;
+        m.refresh();
+        m.backend.open(1, "Terminal");
+        m.refresh();
+        m.backend.open(2, "Notes");
+        m.backend.focused = Some(2);
+        m.refresh();
+        assert_eq!(m.backend().frame(2), Rect::new(505, 25, 495, 600));
+        m.execute(&Command::parse("send coding").unwrap()).unwrap();
+        m.backend.active = 30;
+        m.refresh();
+        // Under 5, on the right: no third column.
+        assert_eq!(m.backend().frame(4), Rect::new(0, 25, 495, 600));
+        assert_eq!(m.backend().frame(5), Rect::new(505, 25, 495, 295));
+        assert_eq!(m.backend().frame(2), Rect::new(505, 330, 495, 295));
+    }
+
+    #[test]
     fn a_window_sent_to_another_space_takes_the_same_place_there() {
         let mut m = three_spaces();
         m.backend.active = 30;
