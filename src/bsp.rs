@@ -481,8 +481,10 @@ impl BspTree {
     }
 
     /// Puts `new` at `spot`: down the same steps as far as this tree goes,
-    /// then splitting what is there the way it was split, `new` on the same
-    /// side. Returns `false` if the window is already managed.
+    /// then on to a window on the same side, which it splits the way it was
+    /// split, `new` on the same side. As in `insert`, splits take turns, so
+    /// no three windows end up side by side. Returns `false` if the window
+    /// is already managed.
     pub fn insert_at_spot(&mut self, new: WinId, spot: &Spot) -> bool {
         if self.contains(new) {
             return false;
@@ -492,18 +494,25 @@ impl BspTree {
             return true;
         };
         let (mut step, before) = spot.0.split_last().expect("a spot has a step");
-        for s in before {
-            if matches!(node, Node::Leaf(_)) {
-                // This tree ends here: split the window that is here.
-                step = s;
-                break;
-            }
-            let Node::Split { a, b, .. } = node else {
-                unreachable!()
+        let mut steps = before.iter();
+        let mut parent = None;
+        while let Node::Split { split, a, b, .. } = node {
+            // Past the end of the way there, keep to the same side.
+            let side = match steps.next() {
+                Some(s) => s.0,
+                None => step.0,
             };
-            node = if s.0 == Side::A { a } else { b };
+            parent = Some(*split);
+            node = if side == Side::A { a } else { b };
         }
-        let &(side, split, ratio) = step;
+        if let Some(s) = steps.next() {
+            // This tree ended before the way did: split as that step did.
+            step = s;
+        }
+        let &(side, mut split, ratio) = step;
+        if parent == Some(split) {
+            split = split.toggled();
+        }
         let here = std::mem::replace(node, Node::Leaf(new));
         let (a, b) = match side {
             Side::A => (Node::Leaf(new), here),
@@ -990,6 +999,25 @@ mod tests {
         let mut none = BspTree::new();
         assert!(none.insert_at_spot(3, &spot));
         assert_eq!(frame(&none, 3), AREA);
+    }
+
+    #[test]
+    fn a_spot_never_puts_three_side_by_side() {
+        // 2 on the right of 1, going to a tree of two side by side: under
+        // the right one, not as a third column.
+        let spot = tree(&[1, 2]).spot(2).unwrap();
+        let mut two = tree(&[4, 5]);
+        assert!(two.insert_at_spot(2, &spot));
+        assert_eq!(frame(&two, 4), Rect::new(0, 0, 495, 600));
+        assert_eq!(frame(&two, 5), Rect::new(505, 0, 495, 295));
+        assert_eq!(frame(&two, 2), Rect::new(505, 305, 495, 295));
+        // From the left: over the left one.
+        let spot = tree(&[1, 2]).spot(1).unwrap();
+        let mut two = tree(&[4, 5]);
+        assert!(two.insert_at_spot(1, &spot));
+        assert_eq!(frame(&two, 1), Rect::new(0, 0, 495, 295));
+        assert_eq!(frame(&two, 4), Rect::new(0, 305, 495, 295));
+        assert_eq!(frame(&two, 5), Rect::new(505, 0, 495, 600));
     }
 
     #[test]
