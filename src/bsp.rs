@@ -217,6 +217,12 @@ pub fn split_rect(area: Rect, split: Split, ratio: f32, gap: i32) -> (Rect, Rect
     }
 }
 
+/// Where a window sat in a tree: each step down from the root to it, with
+/// how the area was split there. A window can go back to the same place in
+/// that tree, or to the same place in another.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Spot(Vec<(Side, Split, f32)>);
+
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct BspTree {
     root: Option<Node>,
@@ -457,6 +463,59 @@ impl BspTree {
         let (root, removed) = rec(root, win);
         self.root = root;
         removed
+    }
+
+    /// Where `win` sits, to put it back there later. `None` for a window
+    /// alone in its tree: there is no place to remember.
+    pub fn spot(&self, win: WinId) -> Option<Spot> {
+        let mut node = self.root.as_ref()?;
+        let mut steps = Vec::new();
+        for side in self.path(win)? {
+            let Node::Split { split, ratio, a, b } = node else {
+                return None;
+            };
+            steps.push((side, *split, *ratio));
+            node = if side == Side::A { a } else { b };
+        }
+        (!steps.is_empty()).then_some(Spot(steps))
+    }
+
+    /// Puts `new` at `spot`: down the same steps as far as this tree goes,
+    /// then splitting what is there the way it was split, `new` on the same
+    /// side. Returns `false` if the window is already managed.
+    pub fn insert_at_spot(&mut self, new: WinId, spot: &Spot) -> bool {
+        if self.contains(new) {
+            return false;
+        }
+        let Some(mut node) = self.root.as_mut() else {
+            self.root = Some(Node::Leaf(new));
+            return true;
+        };
+        let (mut step, before) = spot.0.split_last().expect("a spot has a step");
+        for s in before {
+            if matches!(node, Node::Leaf(_)) {
+                // This tree ends here: split the window that is here.
+                step = s;
+                break;
+            }
+            let Node::Split { a, b, .. } = node else {
+                unreachable!()
+            };
+            node = if s.0 == Side::A { a } else { b };
+        }
+        let &(side, split, ratio) = step;
+        let here = std::mem::replace(node, Node::Leaf(new));
+        let (a, b) = match side {
+            Side::A => (Node::Leaf(new), here),
+            Side::B => (here, Node::Leaf(new)),
+        };
+        *node = Node::Split {
+            split,
+            ratio,
+            a: Box::new(a),
+            b: Box::new(b),
+        };
+        true
     }
 
     /// Exchanges the positions of two windows.
@@ -899,6 +958,44 @@ mod tests {
             last = Some(id);
         }
         t
+    }
+
+    #[test]
+    fn a_window_goes_back_to_its_spot() {
+        // 1 on the left, 2 over 3 on the right.
+        let mut t = tree(&[1, 2, 3]);
+        let before = t.clone();
+        let spot = t.spot(3).unwrap();
+        t.remove(3);
+        assert!(t.insert_at_spot(3, &spot));
+        assert_eq!(t, before);
+        assert!(!t.insert_at_spot(3, &spot), "already there");
+    }
+
+    #[test]
+    fn a_spot_carries_over_to_another_tree() {
+        let spot = tree(&[1, 2, 3]).spot(3).unwrap();
+        // Two windows side by side: 3 goes under the right one.
+        let mut two = tree(&[4, 5]);
+        assert!(two.insert_at_spot(3, &spot));
+        assert_eq!(frame(&two, 4), Rect::new(0, 0, 495, 600));
+        assert_eq!(frame(&two, 5), Rect::new(505, 0, 495, 295));
+        assert_eq!(frame(&two, 3), Rect::new(505, 305, 495, 295));
+        // One window: 3 goes to its right, as far as that tree goes.
+        let mut one = tree(&[4]);
+        assert!(one.insert_at_spot(3, &spot));
+        assert_eq!(frame(&one, 4), Rect::new(0, 0, 495, 600));
+        assert_eq!(frame(&one, 3), Rect::new(505, 0, 495, 600));
+        // No window: 3 has it all.
+        let mut none = BspTree::new();
+        assert!(none.insert_at_spot(3, &spot));
+        assert_eq!(frame(&none, 3), AREA);
+    }
+
+    #[test]
+    fn a_window_alone_has_no_spot() {
+        assert_eq!(tree(&[1]).spot(1), None);
+        assert_eq!(tree(&[1, 2]).spot(9), None);
     }
 
     #[test]
