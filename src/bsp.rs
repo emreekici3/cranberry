@@ -38,6 +38,28 @@ enum Side {
     B,
 }
 
+impl Side {
+    fn other(self) -> Self {
+        match self {
+            Side::A => Side::B,
+            Side::B => Side::A,
+        }
+    }
+}
+
+/// Turns one split a quarter clockwise, as `BspTree::rotate` turns them all:
+/// side by side becomes stacked with the order kept (left to the top), and
+/// stacked becomes side by side with the order reversed (top to the right).
+/// Returns whether the two halves change sides.
+fn rotate_split(split: &mut Split, ratio: &mut f32) -> bool {
+    *split = split.toggled();
+    let swapped = *split == Split::Columns;
+    if swapped {
+        *ratio = 1.0 - *ratio;
+    }
+    swapped
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum Node {
     Leaf(WinId),
@@ -222,6 +244,54 @@ pub fn split_rect(area: Rect, split: Split, ratio: f32, gap: i32) -> (Rect, Rect
 /// that tree, or to the same place in another.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Spot(Vec<(Side, Split, f32)>);
+
+/// A split in a tree, by the way down to it from the root.
+#[derive(Clone, Debug, PartialEq)]
+pub struct At(Vec<Side>);
+
+/// A change to the shape of a tree that a spot taken from it should follow,
+/// so the window still goes back where the change would have put it.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Reshape {
+    Rotate,
+    Flip(At),
+    ToggleSplit(At),
+}
+
+impl Spot {
+    /// Applies `change` to the place, as it was applied to the tree the
+    /// spot came from (now without the window).
+    pub fn reshape(&mut self, change: &Reshape) {
+        let at = match change {
+            Reshape::Rotate => {
+                for (side, split, ratio) in &mut self.0 {
+                    if rotate_split(split, ratio) {
+                        *side = side.other();
+                    }
+                }
+                return;
+            }
+            Reshape::Flip(at) | Reshape::ToggleSplit(at) => at,
+        };
+        // Only a split on the way down to the window's place counts: the
+        // last step is the split the window made, which is not in the tree,
+        // and a split under it is inside what the window shared its slot with.
+        let depth = at.0.len();
+        let on_the_way = depth + 1 < self.0.len()
+            && self.0.iter().zip(&at.0).all(|((side, _, _), s)| side == s);
+        if !on_the_way {
+            return;
+        }
+        let (side, split, ratio) = &mut self.0[depth];
+        match change {
+            Reshape::Flip(_) => {
+                *side = side.other();
+                *ratio = 1.0 - *ratio;
+            }
+            _ => *split = split.toggled(),
+        }
+    }
+}
 
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct BspTree {
@@ -481,38 +551,53 @@ impl BspTree {
     }
 
     /// Puts `new` at `spot`: down the same steps as far as this tree goes,
-    /// then on to a window on the same side, which it splits the way it was
-    /// split, `new` on the same side. As in `insert`, splits take turns, so
-    /// no three windows end up side by side. Returns `false` if the window
-    /// is already managed.
+    /// then splitting what is there the way it was split, `new` on the same
+    /// side. In the same tree, that is just where the window was. In another,
+    /// splits take turns as in `insert`, so no three windows end up side by
+    /// side. Returns `false` if the window is already managed.
     pub fn insert_at_spot(&mut self, new: WinId, spot: &Spot) -> bool {
         if self.contains(new) {
             return false;
         }
-        let Some(mut node) = self.root.as_mut() else {
+        let Some(root) = self.root.as_ref() else {
             self.root = Some(Node::Leaf(new));
             return true;
         };
+        // Never empty: `spot` makes none, and `Spot::reshape` keeps the steps.
         let (mut step, before) = spot.0.split_last().expect("a spot has a step");
-        let mut steps = before.iter();
+        // Find the way to where `new` goes first, then make the one change.
+        let mut way = Vec::new();
         let mut parent = None;
+        let mut node = root;
+        let mut steps = before.iter();
+        // Down the way there, as far as this tree goes.
         while let Node::Split { split, a, b, .. } = node {
-            // Past the end of the way there, keep to the same side.
-            let side = match steps.next() {
-                Some(s) => s.0,
-                None => step.0,
+            let Some(s) = steps.next() else {
+                break;
             };
+            way.push(s.0);
             parent = Some(*split);
-            node = if side == Side::A { a } else { b };
+            node = if s.0 == Side::A { a } else { b };
         }
         if let Some(s) = steps.next() {
             // This tree ended before the way did: split as that step did.
             step = s;
         }
+        // Splitting a split the same way would line three windows up: go on
+        // into it instead, on the window's side.
+        while let Node::Split { split, a, b, .. } = node {
+            if *split != step.1 {
+                break;
+            }
+            way.push(step.0);
+            parent = Some(*split);
+            node = if step.0 == Side::A { a } else { b };
+        }
         let &(side, mut split, ratio) = step;
         if parent == Some(split) {
             split = split.toggled();
         }
+        let node = self.node_at_mut(&way);
         let here = std::mem::replace(node, Node::Leaf(new));
         let (a, b) = match side {
             Side::A => (Node::Leaf(new), here),
@@ -734,6 +819,13 @@ impl BspTree {
         Some(rect)
     }
 
+    /// The split containing `win`, the one `flip` and `toggle_split` change.
+    pub fn split_of(&self, win: WinId) -> Option<At> {
+        let mut path = self.path(win)?;
+        path.pop()?;
+        Some(At(path))
+    }
+
     /// Switches the split containing `win` between columns and rows.
     pub fn toggle_split(&mut self, win: WinId) -> bool {
         self.with_parent(win, |split, _ratio, _a, _b| *split = split.toggled())
@@ -751,15 +843,8 @@ impl BspTree {
     pub fn rotate(&mut self) {
         fn rec(node: &mut Node) {
             if let Node::Split { split, ratio, a, b } = node {
-                match split {
-                    // Left goes to the top: order is kept.
-                    Split::Columns => *split = Split::Rows,
-                    // Top goes to the right: order is reversed.
-                    Split::Rows => {
-                        *split = Split::Columns;
-                        std::mem::swap(a, b);
-                        *ratio = 1.0 - *ratio;
-                    }
+                if rotate_split(split, ratio) {
+                    std::mem::swap(a, b);
                 }
                 rec(a);
                 rec(b);
@@ -999,6 +1084,115 @@ mod tests {
         let mut none = BspTree::new();
         assert!(none.insert_at_spot(3, &spot));
         assert_eq!(frame(&none, 3), AREA);
+    }
+
+    /// Trees of two to five windows in many shapes: as they open, turned,
+    /// and with each split flipped.
+    fn shapes() -> Vec<BspTree> {
+        let mut out = Vec::new();
+        for n in 2..=5 {
+            let ids: Vec<WinId> = (1..=n).collect();
+            let base = tree(&ids);
+            let mut turned = base.clone();
+            for _ in 0..3 {
+                turned.rotate();
+                out.push(turned.clone());
+            }
+            for &w in &ids {
+                let mut flipped = base.clone();
+                flipped.flip(w);
+                out.push(flipped);
+            }
+            out.push(base);
+        }
+        out
+    }
+
+    /// `t` without `w`, and the spot `w` had in it.
+    fn without(t: &BspTree, w: WinId) -> (BspTree, Spot) {
+        let spot = t.spot(w).unwrap();
+        let mut rest = t.clone();
+        assert!(rest.remove(w));
+        (rest, spot)
+    }
+
+    #[test]
+    fn every_window_goes_back_to_its_spot() {
+        for t in shapes() {
+            for w in t.windows() {
+                let (mut rest, spot) = without(&t, w);
+                assert!(rest.insert_at_spot(w, &spot));
+                assert_eq!(rest, t, "window {w} of {t:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_spot_follows_the_layout_turning() {
+        for t in shapes() {
+            for w in t.windows() {
+                let (mut rest, mut spot) = without(&t, w);
+                let mut whole = t.clone();
+                for turns in 1..=4 {
+                    whole.rotate();
+                    rest.rotate();
+                    spot.reshape(&Reshape::Rotate);
+                    let mut back = rest.clone();
+                    back.insert_at_spot(w, &spot);
+                    assert_eq!(back, whole, "window {w}, {turns} turns, of {t:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_spot_follows_a_flip() {
+        for t in shapes() {
+            for w in t.windows() {
+                let (rest, spot) = without(&t, w);
+                // Where `w`'s split was, and the side its sibling took.
+                let mut was = t.path(w).unwrap();
+                let sibling = was.pop().unwrap().other();
+                for x in rest.windows() {
+                    // A window alone has no split to flip.
+                    let Some(at) = rest.split_of(x) else {
+                        continue;
+                    };
+                    // The same split in the tree with `w` still in it: one
+                    // in what `w` shared its slot with is a level further down.
+                    let mut same = at.0.clone();
+                    if same.starts_with(&was) {
+                        same.insert(was.len(), sibling);
+                    }
+                    let mut whole = t.clone();
+                    let Node::Split { ratio, a, b, .. } = whole.node_at_mut(&same) else {
+                        panic!("not a split");
+                    };
+                    std::mem::swap(a, b);
+                    *ratio = 1.0 - *ratio;
+
+                    let (mut back, mut spot) = (rest.clone(), spot.clone());
+                    back.flip(x);
+                    spot.reshape(&Reshape::Flip(at));
+                    back.insert_at_spot(w, &spot);
+                    assert_eq!(back, whole, "window {w}, {x} flipped, of {t:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_spot_follows_a_toggled_split_without_lining_three_up() {
+        // 1 beside 2 over 3; 3 floats, and 1 and 2 are stacked instead.
+        let (mut rest, mut spot) = without(&tree(&[1, 2, 3]), 3);
+        let at = rest.split_of(2).unwrap();
+        rest.toggle_split(2);
+        spot.reshape(&Reshape::ToggleSplit(at));
+        rest.insert_at_spot(3, &spot);
+        // 3 still shares 2's slot, beside it: not a third row.
+        assert_eq!(frame(&rest, 1), Rect::new(0, 0, 1000, 295));
+        assert_eq!(frame(&rest, 2), Rect::new(0, 305, 495, 295));
+        assert_eq!(frame(&rest, 3), Rect::new(505, 305, 495, 295));
     }
 
     #[test]
