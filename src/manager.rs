@@ -5,7 +5,7 @@ use std::collections::{HashMap, HashSet};
 
 use log::{debug, info, warn};
 
-use crate::bsp::{self, BspTree, WinId};
+use crate::bsp::{self, BspTree, Spot, WinId};
 use crate::command::{Command, DisplayTarget, Zoom};
 use crate::config::{Config, MouseAction, app_matches};
 use crate::geometry::{Direction, Rect};
@@ -42,6 +42,9 @@ pub struct Manager<B: Backend> {
     floating: HashSet<WinId>,
     /// Where each floating window `cberry zoom` grew was before.
     float_zooms: HashMap<WinId, Rect>,
+    /// Where windows sat in a layout before floating or going to another
+    /// Space, to take that place again when they tile: kept only until then.
+    spots: HashMap<WinId, Spot>,
     /// Windows reported closed that may still show up in the window list
     /// during their close animation; they must not be tiled again. Some
     /// apps (Electron ones like Claude or Slack) only hide a window closed
@@ -227,6 +230,7 @@ impl<B: Backend> Manager<B> {
             apps: HashMap::new(),
             floating: HashSet::new(),
             float_zooms: HashMap::new(),
+            spots: HashMap::new(),
             closed: HashSet::new(),
             focused: None,
             shown_border: None,
@@ -529,6 +533,9 @@ impl<B: Backend> Manager<B> {
             };
             if let Some(reason) = leave {
                 debug!("window {id} leaves the layout of Space {tree_space}: {reason}");
+                if reason == "moved to another Space" {
+                    self.remember_spot(tree_space, id);
+                }
                 self.remove_from_space(tree_space, id);
                 dirty |= shown.contains(&tree_space);
             }
@@ -539,13 +546,27 @@ impl<B: Backend> Manager<B> {
             if !shown.contains(&s) && !float_spaces.contains(&s) {
                 let (inner, gap, ratio) =
                     (self.inner_area(), self.config.gap, self.config.split_ratio);
+                let spot = self.spots.remove(&id);
                 let state = self.spaces.entry(s).or_default();
-                state.tree.insert(id, state.focused, inner, gap, ratio);
+                match spot {
+                    Some(spot) => state.tree.insert_at_spot(id, &spot),
+                    None => state.tree.insert(id, state.focused, inner, gap, ratio),
+                };
             }
         }
 
         self.floating.retain(|w| alive.contains(w));
         self.float_zooms.retain(|w, _| alive.contains(w));
+        // A place is kept only until the window is back in a layout.
+        let placed: Vec<WinId> = self
+            .spots
+            .keys()
+            .copied()
+            .filter(|w| !alive.contains(w) || self.is_tiled_anywhere(*w))
+            .collect();
+        for w in placed {
+            self.spots.remove(&w);
+        }
         if !self.synced {
             self.synced = true;
             self.seen.extend(alive.iter().copied());
@@ -625,8 +646,15 @@ impl<B: Backend> Manager<B> {
                     .focused
                     .filter(|t| state.tree.contains(*t))
                     .or_else(|| state.tree.windows().last().copied());
-                debug!("tiling window {id} next to {target:?} on another display");
-                state.tree.insert(id, target, inner, gap, ratio);
+                let spot = self.spots.remove(&id);
+                let state = self.spaces.entry(s).or_default();
+                match spot {
+                    Some(spot) => state.tree.insert_at_spot(id, &spot),
+                    None => {
+                        debug!("tiling window {id} next to {target:?} on another display");
+                        state.tree.insert(id, target, inner, gap, ratio)
+                    }
+                };
                 state.focused = Some(id);
                 if focused_now == Some(id) {
                     self.make_current(s);
@@ -786,7 +814,14 @@ impl<B: Backend> Manager<B> {
 
     /// Tiles `id` by splitting `target` (or the last window), along the
     /// longer side of `target`'s slot, at the configured ratio.
+    /// A window that floated or came from another Space takes the place it
+    /// had there instead.
     fn tile(&mut self, id: WinId, target: Option<WinId>) {
+        if let Some(spot) = self.spots.remove(&id) {
+            debug!("tiling window {id} where it was");
+            self.tree.insert_at_spot(id, &spot);
+            return;
+        }
         let (inner, gap, ratio) = (self.inner_area(), self.config.gap, self.config.split_ratio);
         let target = target
             .filter(|t| self.tree.contains(*t))
@@ -1408,6 +1443,18 @@ impl<B: Backend> Manager<B> {
 
     fn is_tiled_anywhere(&self, id: WinId) -> bool {
         self.tree.contains(id) || self.spaces.values().any(|s| s.tree.contains(id))
+    }
+
+    /// Notes where `id` sits in the layout of `space`, to tile it there again.
+    fn remember_spot(&mut self, space: u64, id: WinId) {
+        let tree = if space == self.active_space {
+            Some(&self.tree)
+        } else {
+            self.spaces.get(&space).map(|state| &state.tree)
+        };
+        if let Some(spot) = tree.and_then(|t| t.spot(id)) {
+            self.spots.insert(id, spot);
+        }
     }
 
     fn remove_from_space(&mut self, space: u64, id: WinId) {
@@ -2504,6 +2551,7 @@ impl<B: Backend> Manager<B> {
                     .focused_window()
                     .or(self.focused)
                     .ok_or("no window is focused")?;
+                self.remember_spot(self.active_space, win);
                 if self.tree.remove(win) {
                     self.floating.insert(win);
                     self.mover.halt(win);
@@ -2550,6 +2598,7 @@ impl<B: Backend> Manager<B> {
                 } else {
                     area.align_in(cell, now.w, now.h)
                 };
+                self.remember_spot(self.active_space, win);
                 if self.tree.remove(win) {
                     self.focused = self.tree.windows().last().copied();
                 }
@@ -4800,6 +4849,62 @@ pub(crate) mod tests {
             m.execute(&Command::parse(line).unwrap()).unwrap();
         }
         m
+    }
+
+    /// 1 on the left, 2 over 3 on the right, on the active Space.
+    fn three_tiled(m: &mut Manager<MockBackend>) {
+        for (id, app) in [(1, "Terminal"), (2, "Notes"), (3, "Mail")] {
+            m.backend.open(id, app);
+            m.backend.focused = Some(id);
+            m.refresh();
+        }
+        assert_eq!(m.backend().frame(1), Rect::new(0, 25, 495, 600));
+        assert_eq!(m.backend().frame(2), Rect::new(505, 25, 495, 295));
+        assert_eq!(m.backend().frame(3), Rect::new(505, 330, 495, 295));
+    }
+
+    #[test]
+    fn a_floated_window_tiles_where_it_was() {
+        let mut m = three_spaces();
+        three_tiled(&mut m);
+        let before = m.tree().clone();
+        m.execute(&Command::ToggleFloat).unwrap();
+        // The focus moves on to 1 while 3 floats.
+        m.backend.focused = Some(1);
+        m.refresh();
+        m.backend.focused = Some(3);
+        m.execute(&Command::ToggleFloat).unwrap();
+        assert_eq!(m.tree(), &before, "under 2, not beside 1");
+        assert!(m.spots.is_empty(), "forgotten once back");
+    }
+
+    #[test]
+    fn a_window_sent_to_another_space_takes_the_same_place_there() {
+        let mut m = three_spaces();
+        m.backend.active = 30;
+        m.backend.open(4, "Zed");
+        m.refresh();
+        m.backend.open(5, "Finder");
+        m.refresh();
+        m.backend.active = 10;
+        m.refresh();
+        three_tiled(&mut m);
+        m.execute(&Command::parse("send coding").unwrap()).unwrap();
+        assert!(m.spots.is_empty());
+        m.backend.active = 30;
+        m.refresh();
+        // 4 on the left, 5 over 3 on the right, as 3 was on Space 1.
+        assert_eq!(m.backend().frame(4), Rect::new(0, 25, 495, 600));
+        assert_eq!(m.backend().frame(5), Rect::new(505, 25, 495, 295));
+        assert_eq!(m.backend().frame(3), Rect::new(505, 330, 495, 295));
+        // And back again: under 2, where it started.
+        m.backend.focused = Some(3);
+        m.execute(&Command::parse("send general").unwrap()).unwrap();
+        m.backend.active = 10;
+        m.refresh();
+        assert_eq!(m.backend().frame(1), Rect::new(0, 25, 495, 600));
+        assert_eq!(m.backend().frame(2), Rect::new(505, 25, 495, 295));
+        assert_eq!(m.backend().frame(3), Rect::new(505, 330, 495, 295));
     }
 
     #[test]
