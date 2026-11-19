@@ -5,7 +5,7 @@ use std::collections::{HashMap, HashSet};
 
 use log::{debug, info, warn};
 
-use crate::bsp::{self, BspTree, Spot, WinId};
+use crate::bsp::{self, BspTree, Reshape, Spot, WinId};
 use crate::command::{Command, DisplayTarget, Zoom};
 use crate::config::{Config, MouseAction, app_matches};
 use crate::geometry::{Direction, Rect};
@@ -43,8 +43,9 @@ pub struct Manager<B: Backend> {
     /// Where each floating window `cberry zoom` grew was before.
     float_zooms: HashMap<WinId, Rect>,
     /// Where windows sat in a layout before floating or going to another
-    /// Space, to take that place again when they tile: kept only until then.
-    spots: HashMap<WinId, Spot>,
+    /// Space, and the Space of that layout, to take that place again when
+    /// they tile: kept only until then.
+    spots: HashMap<WinId, (u64, Spot)>,
     /// Windows reported closed that may still show up in the window list
     /// during their close animation; they must not be tiled again. Some
     /// apps (Electron ones like Claude or Slack) only hide a window closed
@@ -546,7 +547,7 @@ impl<B: Backend> Manager<B> {
             if !shown.contains(&s) && !float_spaces.contains(&s) {
                 let (inner, gap, ratio) =
                     (self.inner_area(), self.config.gap, self.config.split_ratio);
-                let spot = self.spots.remove(&id);
+                let spot = self.spots.remove(&id).map(|(_, spot)| spot);
                 let state = self.spaces.entry(s).or_default();
                 match spot {
                     Some(spot) => state.tree.insert_at_spot(id, &spot),
@@ -646,7 +647,7 @@ impl<B: Backend> Manager<B> {
                     .focused
                     .filter(|t| state.tree.contains(*t))
                     .or_else(|| state.tree.windows().last().copied());
-                let spot = self.spots.remove(&id);
+                let spot = self.spots.remove(&id).map(|(_, spot)| spot);
                 let state = self.spaces.entry(s).or_default();
                 match spot {
                     Some(spot) => state.tree.insert_at_spot(id, &spot),
@@ -817,7 +818,7 @@ impl<B: Backend> Manager<B> {
     /// A window that floated or came from another Space takes the place it
     /// had there instead.
     fn tile(&mut self, id: WinId, target: Option<WinId>) {
-        if let Some(spot) = self.spots.remove(&id) {
+        if let Some((_, spot)) = self.spots.remove(&id) {
             debug!("tiling window {id} where it was");
             self.tree.insert_at_spot(id, &spot);
             return;
@@ -1453,7 +1454,17 @@ impl<B: Backend> Manager<B> {
             self.spaces.get(&space).map(|state| &state.tree)
         };
         if let Some(spot) = tree.and_then(|t| t.spot(id)) {
-            self.spots.insert(id, spot);
+            self.spots.insert(id, (space, spot));
+        }
+    }
+
+    /// Has the places remembered in the layout on screen follow a change
+    /// made to it, so windows still go back where it would have put them.
+    fn reshape_spots(&mut self, change: Reshape) {
+        for (space, spot) in self.spots.values_mut() {
+            if *space == self.active_space {
+                spot.reshape(&change);
+            }
         }
     }
 
@@ -2495,16 +2506,21 @@ impl<B: Backend> Manager<B> {
                 }
                 self.remember_fit(unchanged);
             }
-            Command::Rotate => self.tree.rotate(),
+            Command::Rotate => {
+                self.tree.rotate();
+                self.reshape_spots(Reshape::Rotate);
+            }
             Command::Flip => {
-                if !self.tree.flip(focused()?) {
-                    return Err("the window is not split".into());
-                }
+                let win = focused()?;
+                let at = self.tree.split_of(win).ok_or("the window is not split")?;
+                self.tree.flip(win);
+                self.reshape_spots(Reshape::Flip(at));
             }
             Command::ToggleSplit => {
-                if !self.tree.toggle_split(focused()?) {
-                    return Err("the window is not split".into());
-                }
+                let win = focused()?;
+                let at = self.tree.split_of(win).ok_or("the window is not split")?;
+                self.tree.toggle_split(win);
+                self.reshape_spots(Reshape::ToggleSplit(at));
             }
             Command::Balance => self.tree.equalize(self.config.split_ratio),
             Command::BalanceArea => self.tree.balance(),
@@ -4861,6 +4877,25 @@ pub(crate) mod tests {
         assert_eq!(m.backend().frame(1), Rect::new(0, 25, 495, 600));
         assert_eq!(m.backend().frame(2), Rect::new(505, 25, 495, 295));
         assert_eq!(m.backend().frame(3), Rect::new(505, 330, 495, 295));
+    }
+
+    #[test]
+    fn a_floated_window_tiles_where_a_rotation_would_have_put_it() {
+        let mut m = three_spaces();
+        three_tiled(&mut m);
+        let mut turned = m.tree().clone();
+        turned.rotate();
+        m.execute(&Command::ToggleFloat).unwrap();
+        m.backend.focused = Some(1);
+        m.refresh();
+        m.execute(&Command::Rotate).unwrap();
+        m.backend.focused = Some(3);
+        m.execute(&Command::ToggleFloat).unwrap();
+        // 1 on top, 3 beside 2 below it, 3 on the left.
+        assert_eq!(m.tree(), &turned);
+        assert_eq!(m.backend().frame(1), Rect::new(0, 25, 1000, 295));
+        assert_eq!(m.backend().frame(3), Rect::new(0, 330, 495, 295));
+        assert_eq!(m.backend().frame(2), Rect::new(505, 330, 495, 295));
     }
 
     #[test]
